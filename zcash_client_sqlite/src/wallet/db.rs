@@ -589,6 +589,49 @@ CREATE INDEX idx_ironwood_received_note_spends_transaction_id ON ironwood_receiv
     transaction_id ASC
 )";
 
+/// Stores the note-split decomposition and status of the single in-progress Orchard -> Ironwood
+/// pool migration (ZIP 318). The table DDL and store live in the `zcash_pool_migration_sqlite`
+/// crate; this golden copy tracks the schema those tables install into `wallet.db`. The
+/// `*_values` / `funding_notes` columns hold little-endian `u64` arrays.
+pub(super) const TABLE_POOL_MIGRATIONS: &str = "
+CREATE TABLE pool_migrations (
+    id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL,
+    migration_outputs BLOB NOT NULL,
+    crossing_values BLOB NOT NULL,
+    change INTEGER,
+    prep_fee_zatoshi INTEGER NOT NULL,
+    total_input_zatoshi INTEGER NOT NULL,
+    total_migratable_zatoshi INTEGER NOT NULL,
+    funding_notes BLOB NOT NULL,
+    preparation BLOB NOT NULL
+)";
+/// Stores one row per transaction of the in-progress pool migration: its pre-signed PCZT (`pczt`,
+/// `NULL` until built/signed under two-phase signing), dependency graph, schedule, and lifecycle
+/// state. See [`TABLE_POOL_MIGRATIONS`].
+pub(super) const TABLE_POOL_MIGRATION_TRANSACTIONS: &str = "
+CREATE TABLE pool_migration_transactions (
+    migration_id INTEGER NOT NULL REFERENCES pool_migrations(id) ON DELETE CASCADE,
+    tx_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    layer INTEGER,
+    tx_index INTEGER,
+    crossing INTEGER,
+    pczt BLOB,
+    depends_on BLOB NOT NULL,
+    scheduled_height INTEGER NOT NULL,
+    expiry_height INTEGER NOT NULL,
+    anchor_boundary INTEGER,
+    state TEXT NOT NULL,
+    txid BLOB,
+    mined_height INTEGER,
+    PRIMARY KEY (migration_id, tx_id)
+)";
+pub(super) const INDEX_POOL_MIGRATION_TX_DUE: &str = "
+CREATE INDEX idx_pool_migration_tx_due ON pool_migration_transactions (
+    state, scheduled_height
+)";
+
 /// Stores the transparent outputs received by the wallet.
 ///
 /// Originally this table only stored the current UTXO set (as of latest refresh), and the
