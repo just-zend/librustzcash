@@ -616,9 +616,9 @@ where
                 let mut spends = Vec::with_capacity(prep_tx.inputs().len());
                 for input in prep_tx.inputs() {
                     match input {
-                        PrepInput::Wallet(i) => {
+                        PrepInput::Wallet { index, .. } => {
                             let witness = backend
-                                .resolve_wallet_note(*i, anchor)
+                                .resolve_wallet_note(*index, anchor)
                                 .map_err(CommitError::Backend)?;
                             spends.push(witness);
                         }
@@ -819,12 +819,8 @@ where
     let mut prior_values: Vec<u64> = Vec::new();
     for &(_, plan_index) in &targets {
         for input in state.preparation.layers()[ready_layer][plan_index].inputs() {
-            if let PrepInput::Prior { .. } = input {
-                let value = state
-                    .preparation
-                    .input_value(input, &[])
-                    .ok_or_else(|| CommitError::Build("prior input does not resolve".into()))?;
-                prior_values.push(value);
+            if let PrepInput::Prior { value, .. } = input {
+                prior_values.push(*value);
             }
         }
     }
@@ -838,9 +834,9 @@ where
         let mut spends = Vec::with_capacity(prep_tx.inputs().len());
         for input in prep_tx.inputs() {
             match input {
-                PrepInput::Wallet(i) => {
+                PrepInput::Wallet { index, .. } => {
                     let witness = backend
-                        .resolve_wallet_note(*i, anchor)
+                        .resolve_wallet_note(*index, anchor)
                         .map_err(CommitError::Backend)?;
                     spends.push(witness);
                 }
@@ -1496,8 +1492,8 @@ mod commit_tests {
         // buffer, so the engine derives the same buffer and each transfer crosses one ZEC.
         let crossings: Vec<u64> = funding.iter().map(|&f| f - buffer).collect();
         let note_split = NoteSplitPlan::from_stored_parts(
-            funding.clone(),
             crossings.clone(),
+            buffer,
             None,
             prep_fee(),
             whale,
@@ -1522,12 +1518,8 @@ mod commit_tests {
             }
             for tx in layer {
                 for input in tx.inputs() {
-                    if let PrepInput::Prior { .. } = input {
-                        feeder_values.push(
-                            plan.preparation()
-                                .input_value(input, &[])
-                                .expect("prior input resolves"),
-                        );
+                    if let PrepInput::Prior { value, .. } = input {
+                        feeder_values.push(*value);
                     }
                 }
             }

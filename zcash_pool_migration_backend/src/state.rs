@@ -386,7 +386,7 @@ mod tests {
     fn state_with(transactions: Vec<MigrationTransaction>) -> MigrationState {
         MigrationState {
             status: MigrationStatus::Committed,
-            note_split: NoteSplitPlan::from_stored_parts(Vec::new(), Vec::new(), None, 0, 0, 0),
+            note_split: NoteSplitPlan::from_stored_parts(Vec::new(), 0, None, 0, 0, 0),
             funding_notes: Vec::new(),
             preparation: PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions,

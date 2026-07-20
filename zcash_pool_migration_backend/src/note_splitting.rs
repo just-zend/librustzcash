@@ -252,16 +252,16 @@ impl NoteSplitPlan {
     /// for a plan produced by `Self::from_notes` means `total_migratable_zatoshi` equals the sum of
     /// `crossing_values`).
     pub fn from_stored_parts(
-        migration_outputs: Vec<u64>,
         crossing_values: Vec<u64>,
+        note_fee_buffer_zatoshi: u64,
         change: Option<u64>,
         prep_fee_zatoshi: u64,
         total_input_zatoshi: u64,
         total_migratable_zatoshi: u64,
     ) -> Self {
         Self {
-            migration_outputs,
             crossing_values,
+            note_fee_buffer_zatoshi,
             change,
             prep_fee_zatoshi,
             total_input_zatoshi,
