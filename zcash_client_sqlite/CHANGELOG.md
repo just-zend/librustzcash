@@ -61,6 +61,9 @@ workspace.
   lock lasts, and `lock_owner` records the flow that acquired it.
 
 ### Fixed
+- Legacy Ironwood cutover detection now recognizes the historical ZcashLC
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks` table. Its presence is
+  quarantined and makes migration delivery fail closed instead of treating the wallet as fresh.
 - Immediate reservation and legacy reauthorization now commit their run, lock, source
   reservation, claim, revision, and gross-authorization writes through one non-forgeable SQLite
   transaction boundary, including nested savepoint rollback. Recovery authority is absorbing on

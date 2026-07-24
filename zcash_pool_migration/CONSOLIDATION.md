@@ -1,12 +1,14 @@
 # Ironwood migration capability consolidation
 
-Status: working review note, 2026-07-23. The comparison baseline is
-`zcash/librustzcash` `main` at `683dbd1289fb5768961036bc6984476f7a17f4e5` and
-`just-zend/ZODLIronwoodMigrationRust` `origin/main` at
-`3fb1fdfdfc8185448dbbe7556f38d6c76b4d68e7`. This note records capability
+Status: working review note, refreshed 2026-07-24. The live comparison baseline is
+`zcash/librustzcash` `main` at `df1d8d5508d563b52b08899bd92c2007555b5a22`,
+merged against Zend PR #1's pre-refresh head
+`1d63c9c07b0b40b3de633c8396008ff543464a01`. This note records capability
 decisions; the Rust and downstream SDK pull requests remain the review authority.
+Retired standalone repositories are historical evidence, not rebase sources or
+active implementation guidance.
 
-## Retirement decision
+## Retirement boundary (historical context)
 
 `just-zend/ZODLIronwoodMigrationRust` is no longer the migration engine of record.
 The Chlup repository from which it was forked is likewise no longer a Zend runtime
@@ -20,6 +22,49 @@ The engine of record is the in-tree `zcash_pool_migration`, with canonical
 persistence in `zcash_client_sqlite` and a minimal Zend delta maintained on top of
 `zcash/librustzcash`.
 
+## Current capability decision
+
+The 2026-07-24 reassessment found no newly merged upstream replacement for Zend's
+delivery, immediate-reservation, storage-finality, or legacy-cutover capabilities.
+The new upstream delta through `df1d8d55` is adopted exactly: PR
+[#2754](https://github.com/zcash/librustzcash/pull/2754) releases the
+`zcash_history` / `zcash_encoding` no-std work, and PR
+[#2757](https://github.com/zcash/librustzcash/pull/2757) expands the public
+`propose_send_max_transfer` contract. Neither changes migration runtime semantics
+or the canonical migration schema.
+
+The exact upstream capability set retained as the base is:
+
+- planning, denomination, preparation, scheduling, and lifecycle from PR
+  [#2663](https://github.com/zcash/librustzcash/pull/2663) (`fce025199c`),
+  the 144-block interval from PR
+  [#2729](https://github.com/zcash/librustzcash/pull/2729) (`8d14d03e00`),
+  and expiry/rebuild from PR
+  [#2723](https://github.com/zcash/librustzcash/pull/2723) (`6bfd0fe154`);
+- PCZT proving from PR
+  [#2710](https://github.com/zcash/librustzcash/pull/2710) (`56195ed25e`),
+  note locking from PRs
+  [#2716](https://github.com/zcash/librustzcash/pull/2716) (`beec9b595f`)
+  and [#2726](https://github.com/zcash/librustzcash/pull/2726) (`b2f8dce83d`),
+  and retained checkpoints from PR
+  [#2728](https://github.com/zcash/librustzcash/pull/2728) (`d212c548dd`);
+- normalized `orchard_ironwood_migration[s]_*` persistence from PR
+  [#2713](https://github.com/zcash/librustzcash/pull/2713) (`a41e941f8e`),
+  the exact crate rename from PR
+  [#2744](https://github.com/zcash/librustzcash/pull/2744) (`b96925d6d2`),
+  and exact `BundlePadding` API from PR
+  [#2745](https://github.com/zcash/librustzcash/pull/2745) (`850cb32b44`).
+
+Zend remains additive on that base because upstream still has no durable delivery
+CAS/lease/exact-artifact protocol, reservation-before-exposure immediate lane,
+unknown-outcome recovery, spendable-destination plus deep-rewind finality boundary,
+ordinary-spend/account-deletion authorization, or strict legacy quarantine. Upstream
+`MigrationStatus::Complete` still means that every canonical migration transaction
+is mined; it does not establish that the exact Ironwood destination is scanned,
+spendable, and beyond the source-release horizon. The detailed retained-capability
+section below documents how each additive boundary preserves upstream types, schema,
+and control flow.
+
 ## Upstream implementation and schema adopted unchanged
 
 - ZIP 318 denomination planning uses the canonical `{1, 2, 5} * 10^k` crossings,
@@ -30,8 +75,9 @@ persistence in `zcash_client_sqlite` and a minimal Zend delta maintained on top 
   upstream implementations. Zend does not retain its separate cadence, anchor-bucket,
   expiry, or denomination algorithms in Rust.
 - PCZT construction, deferred anchors and witnesses, software and external-signing
-  seams, proving, exact-note transfer rebuild, and the canonical `MigrationState`
-  lifecycle remain upstream. Relevant merged work includes librustzcash PRs
+  seams, proving, the expired-transfer rebuild API and control flow, and the canonical
+  `MigrationState` lifecycle remain upstream. Zend's stricter exact-note resolution is
+  documented below. Relevant merged work includes librustzcash PRs
   [#2663](https://github.com/zcash/librustzcash/pull/2663),
   [#2695](https://github.com/zcash/librustzcash/pull/2695),
   [#2710](https://github.com/zcash/librustzcash/pull/2710), and
@@ -84,6 +130,11 @@ delivery-control layer rather than forking those implementations:
 - Re-persisting after synchronization acquires newly materialized preparation outputs
   under the same durable owner. `migration_lock_owners` supplies the exact owner set for
   an owner-scoped `LockedInputPolicy`; foreign locks remain ineligible.
+- Expired-transfer rebuild keeps the upstream rebuild API and lifecycle, but resolves the
+  real source note by matching each stored PCZT action nullifier against same-denomination
+  wallet candidates and requiring one exact match. This is necessary after proving fills
+  witnesses: the upstream `witness().is_none()` heuristic no longer uniquely identifies
+  the real input in an already-proved transaction.
 - FVK-only persistence, update, and cancellation adapters expose that same atomic
   boundary to external signers without requiring a `UnifiedSpendingKey`.
 - `validate_pczt_orchard_locks` closes the advisory-lock time-of-check/time-of-use gap:
@@ -145,9 +196,11 @@ delivery-control layer rather than forking those implementations:
   proposal/finalization paths consume this result rather than relying on SDK timing.
 - Account deletion is refused while delivery authority is active or in recovery. Only explicitly
   terminal finalized/abandoned runs may cascade, so unresolved exact bytes cannot be forgotten.
-- Exact legacy standalone objects with either historical prefix are quarantined by case-sensitive
-  name and schema fingerprint. Their existence fails closed; no legacy plan, PCZT, lock, or runtime
-  row is auto-imported into canonical state.
+- Exact legacy standalone objects are quarantined by case-sensitive name and schema fingerprint.
+  This includes both historical prefixes and the exact ZcashLC table
+  `ext_zcashlc_orchard_ironwood_migration_invalid_marks`, which predates those prefixes. Both
+  direct runtime status checks and migration-time quarantine discovery now recognize that table;
+  no legacy plan, PCZT, lock, or runtime row is auto-imported into canonical state.
 
 These changes follow librustzcash's established patterns: domain-typed capability traits,
 the optional wallet adapter boundary, exact output identity, normalized canonical state,
@@ -194,6 +247,35 @@ owner-scoped advisory locks, and atomic multi-write operations with rollback tes
   seeded minimal proving path remains open as
   [PR #2718](https://github.com/zcash/librustzcash/pull/2718). Any new Zend carry should
   be checked against those live references before implementation.
+
+## Future upstream adoption triggers
+
+These were live at the 2026-07-24 checkpoint. Their heads are audit evidence, not
+pins; recheck upstream state before carrying anything.
+
+- [PR #2742](https://github.com/zcash/librustzcash/pull/2742), observed at
+  `b92ebf8d99203d76fdf6830a959494603753e8e7`, extracts `OutputLockStore` and
+  moves locking vocabulary. If merged, adopt its exact trait/module layout; keep Zend's
+  atomic migration-lock transaction only as an additive implementation of that upstream boundary.
+- Draft [PR #2333](https://github.com/zcash/librustzcash/pull/2333), observed at
+  `efb348e4a4163ff4c460ae6f57858c00fb37b134`, redesigns spendability schema and
+  anchor priority. If merged, migrate Zend's exact-output completion SQL to its exact
+  schema/helper. It does not by itself replace migration storage finality.
+- Draft [PR #2738](https://github.com/zcash/librustzcash/pull/2738), observed at
+  `008a36a053129f8b966524d3aaa672751ceaf540`, moves and threads `TargetHeight`.
+  If merged, take the mechanical type/API migration without retaining a parallel Zend
+  target-height abstraction.
+- [PR #2659](https://github.com/zcash/librustzcash/pull/2659), observed at
+  `552130e7bd8b6c472d9e878fb5183913c7c0f685`, adds a backend-agnostic
+  privacy/network layer. If merged, SDK transport may delegate to it where contracts
+  align; Rust's network-free durable delivery authority remains separate unless upstream
+  supplies the same exact outcome and recovery semantics.
+- Closed draft [PR #2705](https://github.com/zcash/librustzcash/pull/2705), branch
+  `31c3cd180821244fe2a8ef7469b692410627f147` (implementation
+  `4b1ce8d6530cb29d2267ff84ec7d9ed2225e2acd`), is not carried. The accepted
+  upstream migration schema is normalized and uses no structured blobs except the opaque
+  PCZT; Zend's separately versioned delivery/finality evidence is not a competing
+  canonical migration-state codec.
 
 ## Candidate upstream proposals after Zend review
 

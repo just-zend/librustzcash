@@ -100,6 +100,18 @@ use crate::AccountUuid;
 #[cfg(feature = "migration-delivery")]
 const MIGRATION_STORAGE_FINALITY_CONFIRMATIONS: u32 = crate::PRUNING_DEPTH + 1;
 
+/// Matches SQLite objects owned by every retired standalone Ironwood migration store. The exact
+/// ZcashLC invalid-marks table predates the shorter `ext_ironwood_migration_` namespace, so it must
+/// be named explicitly instead of relying on the prefix predicates.
+#[cfg(feature = "migration-delivery")]
+const LEGACY_ENGINE_SCHEMA_OBJECT_PREDICATE: &str = r"(name GLOB 'ext_ironwood_migration_*'
+              OR name GLOB 'ironwood_migration_*'
+              OR name IN (
+                  'sdk_invalid_marks',
+                  'sdk_immediate_runs',
+                  'ext_zcashlc_orchard_ironwood_migration_invalid_marks'
+              ))";
+
 #[cfg(feature = "migration-delivery")]
 const DELIVERY_RUN_AUTHORITY_PERSONAL: &[u8; 16] = b"ZendRunAuthV1!!!";
 
@@ -1523,15 +1535,13 @@ pub(crate) fn quarantine_legacy_engine_state(
     conn: &Connection,
     t: &Tables,
 ) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         r"SELECT type, name, IFNULL(sql, '')
            FROM sqlite_schema
-          WHERE (name GLOB 'ext_ironwood_migration_*'
-              OR name GLOB 'ironwood_migration_*'
-              OR name IN ('sdk_invalid_marks', 'sdk_immediate_runs'))
+          WHERE {LEGACY_ENGINE_SCHEMA_OBJECT_PREDICATE}
             AND type IN ('table', 'index', 'trigger', 'view')
-          ORDER BY type, name",
-    )?;
+          ORDER BY type, name"
+    ))?;
     let objects = stmt
         .query_map([], |row| {
             Ok((
@@ -2498,9 +2508,7 @@ fn legacy_cutover_status(conn: &Connection, t: &Tables) -> Result<LegacyCutoverS
             &format!(
                 r"SELECT COUNT(*) FROM (
                      SELECT name AS source_object FROM sqlite_schema
-                      WHERE name GLOB 'ext_ironwood_migration_*'
-                         OR name GLOB 'ironwood_migration_*'
-                         OR name IN ('sdk_invalid_marks', 'sdk_immediate_runs')
+                      WHERE {LEGACY_ENGINE_SCHEMA_OBJECT_PREDICATE}
                      UNION
                      SELECT source_object FROM {}
                  )",
@@ -2511,10 +2519,10 @@ fn legacy_cutover_status(conn: &Connection, t: &Tables) -> Result<LegacyCutoverS
         )?
     } else {
         conn.query_row(
-            r"SELECT COUNT(*) FROM sqlite_schema
-              WHERE name GLOB 'ext_ironwood_migration_*'
-                 OR name GLOB 'ironwood_migration_*'
-                 OR name IN ('sdk_invalid_marks', 'sdk_immediate_runs')",
+            &format!(
+                r"SELECT COUNT(*) FROM sqlite_schema
+                  WHERE {LEGACY_ENGINE_SCHEMA_OBJECT_PREDICATE}"
+            ),
             [],
             |row| row.get(0),
         )?

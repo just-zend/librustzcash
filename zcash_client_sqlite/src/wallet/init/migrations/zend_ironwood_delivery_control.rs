@@ -50,12 +50,95 @@ impl RusqliteMigration for Migration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::init::migrations::tests::test_migrate;
     use schemerz::Migration as _;
+    use secrecy::Secret;
+    use tempfile::NamedTempFile;
+    use zcash_protocol::consensus::Network;
+
+    use crate::{
+        WalletDb,
+        testing::db::{test_clock, test_rng},
+        wallet::init::{WalletMigrator, migrations::tests::test_migrate},
+    };
+
+    const HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE: &str =
+        "ext_zcashlc_orchard_ironwood_migration_invalid_marks";
+    const HISTORICAL_INVALID_MARK_HEIGHT: i64 = 1;
+    const EXPECTED_LEGACY_ROW_COUNT: u64 = 1;
+    const EXPECTED_QUARANTINE_DISPOSITION: &str = "recovery_required";
+    const TEST_SEED_BYTE: u8 = 0xab;
+    const TEST_SEED_LENGTH: usize = 32;
 
     #[test]
     fn migrate_fresh_database_to_delivery_schema() {
         test_migrate(&[MIGRATION_ID]);
+    }
+
+    #[test]
+    fn migration_quarantines_historical_zcashlc_invalid_marks() {
+        let data_file = NamedTempFile::new().unwrap();
+        let mut db_data = WalletDb::for_path(
+            data_file.path(),
+            Network::TestNetwork,
+            test_clock(),
+            test_rng(),
+        )
+        .unwrap();
+        let seed = vec![TEST_SEED_BYTE; TEST_SEED_LENGTH];
+
+        WalletMigrator::new()
+            .with_seed(Secret::new(seed.clone()))
+            .ignore_seed_relevance()
+            .init_or_migrate_to(&mut db_data, DEPENDENCIES)
+            .unwrap();
+        db_data
+            .conn
+            .execute(
+                &format!(
+                    "CREATE TABLE {HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE} (
+                         height INTEGER NOT NULL
+                     )"
+                ),
+                [],
+            )
+            .unwrap();
+        db_data
+            .conn
+            .execute(
+                &format!(
+                    "INSERT INTO {HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE} (height) VALUES (?)"
+                ),
+                [HISTORICAL_INVALID_MARK_HEIGHT],
+            )
+            .unwrap();
+
+        WalletMigrator::new()
+            .with_seed(Secret::new(seed))
+            .ignore_seed_relevance()
+            .init_or_migrate_to(&mut db_data, &[MIGRATION_ID])
+            .unwrap();
+
+        let (detected_rows, disposition): (u64, String) = db_data
+            .conn
+            .query_row(
+                "SELECT detected_rows, disposition
+                   FROM zend_ironwood_legacy_quarantine
+                  WHERE source_object = ?",
+                [HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(detected_rows, EXPECTED_LEGACY_ROW_COUNT);
+        assert_eq!(disposition, EXPECTED_QUARANTINE_DISPOSITION);
+        let retained_rows: u64 = db_data
+            .conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_rows, EXPECTED_LEGACY_ROW_COUNT);
     }
 
     #[test]

@@ -3233,6 +3233,9 @@ mod tests {
     fn legacy_detector_blocks_partial_schemas_but_ignores_prefix_near_misses() {
         use zcash_pool_migration::delivery::{LegacyCutoverStatus, MigrationDeliveryStore};
 
+        const HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE: &str =
+            "ext_zcashlc_orchard_ironwood_migration_invalid_marks";
+
         let mut conn = fresh_conn();
         conn.execute("CREATE TABLE extXironwood_migration_runs (id INTEGER)", [])
             .unwrap();
@@ -3272,6 +3275,34 @@ mod tests {
         let older_store = PoolMigrations::for_account(&mut older, older_account).unwrap();
         assert!(matches!(
             older_store.legacy_cutover_status().unwrap(),
+            LegacyCutoverStatus::RecoveryRequired(_)
+        ));
+
+        let mut zcashlc = fresh_conn();
+        zcashlc
+            .execute(
+                &format!(
+                    "CREATE TABLE {HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE} (mark INTEGER NOT NULL)"
+                ),
+                [],
+            )
+            .unwrap();
+        init_delivery_control_tables(&zcashlc).unwrap();
+        let quarantined: bool = zcashlc
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM zend_ironwood_legacy_quarantine
+                      WHERE source_object = ?
+                 )",
+                [HISTORICAL_ZCASHLC_INVALID_MARKS_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(quarantined);
+        let zcashlc_account = insert_account(&zcashlc);
+        let zcashlc_store = PoolMigrations::for_account(&mut zcashlc, zcashlc_account).unwrap();
+        assert!(matches!(
+            zcashlc_store.legacy_cutover_status().unwrap(),
             LegacyCutoverStatus::RecoveryRequired(_)
         ));
     }
