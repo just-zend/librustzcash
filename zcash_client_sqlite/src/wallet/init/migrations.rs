@@ -64,6 +64,8 @@ mod v_tx_outputs_return_addrs;
 mod v_tx_outputs_use_legacy_false;
 mod wallet_summaries;
 mod witness_stabilized_notes;
+#[cfg(feature = "migration-delivery")]
+mod zend_ironwood_delivery_control;
 
 use std::{rc::Rc, sync::Mutex};
 
@@ -261,6 +263,8 @@ pub(super) fn all_migrations<
         Box::new(orchard_ironwood_migration_tables::Migration),
         Box::new(tree_retained_checkpoints::Migration),
         Box::new(note_locking::Migration),
+        #[cfg(feature = "migration-delivery")]
+        Box::new(zend_ironwood_delivery_control::Migration),
     ]
 }
 
@@ -407,8 +411,12 @@ pub const CURRENT_LEAF_MIGRATIONS: &[Uuid] = &[
     add_transparent_receiver_address_index::MIGRATION_ID,
     add_transparent_value_index::MIGRATION_ID,
     ironwood_pool_code_views::MIGRATION_ID,
+    #[cfg(feature = "migration-delivery")]
+    zend_ironwood_delivery_control::MIGRATION_ID,
+    #[cfg(not(feature = "migration-delivery"))]
     orchard_ironwood_migration_tables::MIGRATION_ID,
     tree_retained_checkpoints::MIGRATION_ID,
+    #[cfg(not(feature = "migration-delivery"))]
     note_locking::MIGRATION_ID,
 ];
 

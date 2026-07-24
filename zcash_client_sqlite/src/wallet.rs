@@ -130,11 +130,10 @@ use crate::{
     WalletCommitmentTrees, WalletDb,
     error::{LockError, SqliteClientError},
     util::Clock,
-    wallet::{
-        commitment_tree::{SqliteShardStore, get_max_checkpointed_height},
-        encoding::LEGACY_ADDRESS_INDEX_NULL,
-    },
+    wallet::{commitment_tree::SqliteShardStore, encoding::LEGACY_ADDRESS_INDEX_NULL},
 };
+
+pub(crate) use self::commitment_tree::get_max_checkpointed_height;
 
 #[cfg(feature = "transparent-inputs")]
 use {
@@ -4108,6 +4107,18 @@ pub(crate) fn truncate_to_height_internal<P: consensus::Parameters>(
         ))
     })?;
 
+    // Audit fixed-horizon migration evidence before any scan queue, transaction, or tree row is
+    // changed. All public truncation/chain-state rewind paths converge here, and the caller's
+    // SQLite transaction makes the recovery marker plus reservation reacquisition atomic with the
+    // destructive wallet mutation.
+    #[cfg(feature = "migration-delivery")]
+    crate::pool_migration::orchard_ironwood::prepare_for_wallet_rewind(conn, truncation_height)
+        .map_err(|error| {
+            SqliteClientError::CorruptedData(format!(
+                "Ironwood migration finality audit blocked wallet rewind: {error}"
+            ))
+        })?;
+
     // Delete from the scanning queue any range with a start height greater than the
     // truncation height, and then truncate any remaining range by setting the end
     // equal to the truncation height + 1. This sets our view of the chain tip back
@@ -5663,7 +5674,7 @@ pub(crate) fn get_locked_outputs(
 }
 
 pub(crate) fn lock_outputs(
-    conn: &rusqlite::Transaction,
+    conn: &rusqlite::Connection,
     outputs: &[OutputRef],
     owner: LockOwner,
     lock_expiry_height: BlockHeight,
@@ -5721,7 +5732,7 @@ fn received_outputs_table(pool: PoolType) -> (&'static str, &'static str) {
 }
 
 pub(crate) fn unlock_output(
-    conn: &rusqlite::Transaction,
+    conn: &rusqlite::Connection,
     output: &OutputRef,
     owner: LockOwner,
 ) -> Result<bool, SqliteClientError> {

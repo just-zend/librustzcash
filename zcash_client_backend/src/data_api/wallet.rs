@@ -976,6 +976,61 @@ where
 /// of transactions that would spend all available funds from the given `spend_pool`s that can then
 /// be authorized and made ready for submission to the network with [`create_proposed_transactions`].
 ///
+/// This read-only variant never locks inputs. It is intended for callers that apply proposal
+/// selection and their own durable reservation records inside one already-open database
+/// transaction.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn propose_send_max_transfer_unlocked<DbT, ParamsT, FeeRuleT, CommitmentTreeErrT>(
+    wallet_db: &DbT,
+    params: &ParamsT,
+    spend_from_account: <DbT as InputSource>::AccountId,
+    spend_pools: &[ShieldedPool],
+    fee_rule: &FeeRuleT,
+    recipient: ZcashAddress,
+    memo: Option<MemoBytes>,
+    mode: MaxSpendMode,
+    confirmations_policy: ConfirmationsPolicy,
+    locked_input_policy: &input_selection::LockedInputPolicy,
+) -> Result<
+    Proposal<FeeRuleT, <DbT as InputSource>::NoteRef>,
+    ProposeSendMaxErrT<DbT, CommitmentTreeErrT, FeeRuleT>,
+>
+where
+    DbT: WalletRead + InputSource<Error = <DbT as WalletRead>::Error>,
+    <DbT as InputSource>::NoteRef: Copy + Eq + Ord,
+    ParamsT: consensus::Parameters + Clone,
+    FeeRuleT: FeeRule + Clone,
+{
+    let (target_height, anchor_height) = wallet_db
+        .get_target_and_anchor_heights(confirmations_policy.trusted())
+        .map_err(|e| Error::from(InputSelectorError::DataSource(e)))?
+        .ok_or_else(|| Error::from(InputSelectorError::SyncRequired))?;
+
+    if memo.is_some() && !recipient.can_receive_memo() {
+        return Err(Error::Payment(zip321::PaymentError::TransparentMemo));
+    }
+
+    Ok(propose_send_max(
+        params,
+        wallet_db,
+        fee_rule,
+        spend_from_account,
+        spend_pools,
+        target_height,
+        anchor_height,
+        mode,
+        confirmations_policy,
+        recipient,
+        memo,
+        locked_input_policy,
+    )?)
+}
+
+/// Select transaction inputs, compute fees, and construct a proposal for a transaction or series
+/// of transactions that would spend all available funds from the given `spend_pool`s that can then
+/// be authorized and made ready for submission to the network with [`create_proposed_transactions`].
+///
 /// When `lock_inputs` is `Some(request)`, the inputs selected by the proposal are locked on
 /// behalf of the request's owner until `target_height + request.for_blocks()` to prevent
 /// concurrent proposals from selecting them; when `None`, no locking is performed. See
@@ -1009,32 +1064,21 @@ where
     ParamsT: consensus::Parameters + Clone,
     FeeRuleT: FeeRule + Clone,
 {
-    let (target_height, anchor_height) = wallet_db
-        .get_target_and_anchor_heights(confirmations_policy.trusted())
-        .map_err(|e| Error::from(InputSelectorError::DataSource(e)))?
-        .ok_or_else(|| Error::from(InputSelectorError::SyncRequired))?;
-
-    if memo.is_some() && !recipient.can_receive_memo() {
-        return Err(Error::Payment(zip321::PaymentError::TransparentMemo));
-    }
-
-    let proposal = propose_send_max(
-        params,
+    let proposal = propose_send_max_transfer_unlocked::<_, _, _, CommitmentTreeErrT>(
         wallet_db,
-        fee_rule,
+        params,
         spend_from_account,
         spend_pools,
-        target_height,
-        anchor_height,
-        mode,
-        confirmations_policy,
+        fee_rule,
         recipient,
         memo,
+        mode,
+        confirmations_policy,
         locked_input_policy,
     )?;
 
     if let Some(request) = lock_inputs {
-        let lock_expiry_height = target_height + request.for_blocks();
+        let lock_expiry_height = proposal.min_target_height() + request.for_blocks();
         lock_proposal_inputs(wallet_db, &proposal, request.owner(), lock_expiry_height)?;
     }
 

@@ -65,6 +65,7 @@ graph TB
     zcash_pool_migration -.-> zcash_client_backend
 
     zcash_client_backend --> pczt
+    %% zcash_client_sqlite --> pczt
     zcash_pool_migration --> pczt
 
     %% zcash_client_sqlite --> zcash_keys
@@ -107,6 +108,7 @@ graph TB
     %% zcash_transparent --> zcash_encoding
     %% zcash_client_backend --> zcash_encoding
     %% zcash_keys --> zcash_encoding
+    %% zcash_pool_migration --> zcash_encoding
     %% zcash_primitives --> zcash_encoding
     %% zcash_address --> zcash_encoding
     zcash_protocol --> zcash_encoding
@@ -133,6 +135,7 @@ graph TB
     %% zcash_primitives --> zcash_note_encryption
     %% pczt --> zcash_note_encryption
     %% zcash_client_backend --> zcash_note_encryption
+    %% zcash_client_sqlite --> zcash_note_encryption
 
     %% zcash_client_sqlite --> zip32
     %% zcash_client_backend --> zip32

@@ -3996,13 +3996,20 @@ pub fn lock_conflict_and_batch_atomicity<T: ShieldedPoolTester>(
         assert_eq!(locked, expected);
     }
 
+    // Exact release is owner-scoped: owner A's r1 is removed, while owner B's r2 survives.
+    // Retrying the same exact release is idempotent.
+    assert!(st.wallet_mut().unlock_output(&r1, owner_a).unwrap());
+    assert_eq!(
+        st.wallet().get_locked_outputs(account_id).unwrap(),
+        vec![r2],
+        "batch release must preserve another owner's lock"
+    );
+    assert!(!st.wallet_mut().unlock_output(&r1, owner_a).unwrap());
+
     // Unlocking is owner-scoped: owner A cannot release owner B's lock on r2, and unlocking
     // an unknown output reports `false`.
     assert!(!st.wallet_mut().unlock_output(&r2, owner_a).unwrap());
-    assert_eq!(
-        st.get_locked_balance(account_id),
-        (value1 + value2).unwrap()
-    );
+    assert_eq!(st.get_locked_balance(account_id), value2);
     let unknown = OutputRef::new(
         TxId::from_bytes([0xEE; 32]),
         PoolType::Shielded(T::SHIELDED_PROTOCOL),
@@ -4014,7 +4021,7 @@ pub fn lock_conflict_and_batch_atomicity<T: ShieldedPoolTester>(
     // `false`.
     assert!(st.wallet_mut().unlock_output(&r2, owner_b).unwrap());
     assert!(!st.wallet_mut().unlock_output(&r2, owner_b).unwrap());
-    assert!(st.wallet_mut().unlock_output(&r1, owner_a).unwrap());
+    assert!(!st.wallet_mut().unlock_output(&r1, owner_a).unwrap());
     assert_eq!(st.get_locked_balance(account_id), Zatoshis::ZERO);
 
     // With everything released, a single owner can lock both notes in one batch.

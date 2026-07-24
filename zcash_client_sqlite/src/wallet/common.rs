@@ -179,6 +179,62 @@ pub(crate) fn output_eligible_condition(lock_filter: LockFilter<'_>, tbl: &str) 
     }
 }
 
+/// Generates a storage-authoritative exclusion for Orchard sources reserved by an active or
+/// recovery-required Ironwood migration. Unlike advisory lock filtering, callers cannot override
+/// this predicate by supplying a known lock owner or `LockFilter::Unfiltered`.
+#[cfg(feature = "migration-delivery")]
+fn migration_source_reservation_condition(
+    conn: &Connection,
+    protocol: ShieldedPool,
+    transaction_alias: &str,
+    received_alias: &str,
+    output_index_col: &str,
+    lock_filter: LockFilter<'_>,
+) -> Result<String, rusqlite::Error> {
+    if protocol != ShieldedPool::Orchard {
+        return Ok("1".to_string());
+    }
+    if !crate::pool_migration::orchard_ironwood::delivery_schema_is_compatible(conn)? {
+        // Missing, partial, forged, future, or relationally corrupt authority is never evidence
+        // that no reservation exists. Fail closed before referring to any additive table name.
+        return Ok("0".to_string());
+    }
+    const RESERVATIONS: &str = "zend_orchard_ironwood_delivery_reservations";
+    const RUNS: &str = "zend_orchard_ironwood_delivery_runs";
+    let canonical_owner_override = match lock_filter {
+        LockFilter::Unfiltered => "0".to_owned(),
+        LockFilter::Policy(_) => format!(
+            "migration_run.lane = 'canonical' \
+             AND migration_run.status = 'active' \
+             AND migration_run.canonical_lock_owner = {received_alias}.lock_owner \
+             AND migration_run.canonical_lock_owner IN rarray(:overridable_owners)"
+        ),
+    };
+    Ok(format!(
+        "NOT EXISTS (
+             SELECT 1 FROM {RESERVATIONS} migration_reservation
+             JOIN {RUNS} migration_run
+               ON migration_run.run_identity = migration_reservation.run_identity
+              WHERE migration_reservation.source_txid = {transaction_alias}.txid
+                AND migration_reservation.source_index = {received_alias}.{output_index_col}
+                AND migration_reservation.status IN ('active', 'recovery_required')
+                AND NOT ({canonical_owner_override})
+         )"
+    ))
+}
+
+#[cfg(not(feature = "migration-delivery"))]
+fn migration_source_reservation_condition(
+    _conn: &Connection,
+    _protocol: ShieldedPool,
+    _transaction_alias: &str,
+    _received_alias: &str,
+    _output_index_col: &str,
+    _lock_filter: LockFilter<'_>,
+) -> Result<String, rusqlite::Error> {
+    Ok("1".to_string())
+}
+
 /// Builds the `:overridable_owners` rarray for the given [`LockFilter`]: the byte strings of the
 /// lock owners whose locked outputs the filter's policy admits.
 ///
@@ -287,7 +343,7 @@ pub(crate) fn output_lockable_condition() -> &'static str {
     "lock_expiry_height IS NULL OR lock_expiry_height <= :chain_tip OR lock_owner = :owner"
 }
 
-fn unscanned_tip_exists(
+pub(crate) fn unscanned_tip_exists(
     conn: &Connection,
     anchor_height: BlockHeight,
     table_prefix: &'static str,
@@ -401,6 +457,14 @@ where
         (":target_height", &target_height_arg),
     ];
     push_lock_params(&mut sql_params, lock_filter, &overridable_owners);
+    let reservation_condition = migration_source_reservation_condition(
+        conn,
+        protocol,
+        "t",
+        "rn",
+        output_index_col,
+        lock_filter,
+    )?;
 
     let result = conn.query_row_and_then(
         &format!(
@@ -427,6 +491,7 @@ where
              AND rn.commitment_tree_position IS NOT NULL
              AND rn.id NOT IN ({}) -- the note is unspent
              AND ({}) -- the note is eligible under the lock filter
+             AND ({reservation_condition}) -- not an active migration source reservation
              GROUP BY rn.id",
             spent_notes_clause(table_prefix),
             output_eligible_condition(lock_filter, "rn"),
@@ -568,6 +633,14 @@ where
         ..
     } = table_constants::<SqliteClientError>(protocol)?;
 
+    let reservation_condition = migration_source_reservation_condition(
+        conn,
+        protocol,
+        "t",
+        "rn",
+        output_index_col,
+        lock_filter,
+    )?;
     // Select all unspent notes belonging to the given account, ignoring dust notes.
     let mut stmt_select_notes = conn.prepare_cached(&format!(
         "SELECT
@@ -602,6 +675,7 @@ where
          AND rn.id NOT IN rarray(:exclude)  -- the note is not excluded
          AND rn.id NOT IN ({})  -- the note is unspent
          AND ({}) -- the note is eligible under the lock filter
+         AND ({reservation_condition}) -- not an active migration source reservation
          GROUP BY rn.id",
         tx_unexpired_condition("t"),
         spent_notes_clause(table_prefix),
@@ -778,6 +852,14 @@ where
         "SELECT * from eligible WHERE so_far >= :target_value LIMIT 1"
     };
     let eligible_condition = output_eligible_condition(lock_filter, "rn");
+    let reservation_condition = migration_source_reservation_condition(
+        conn,
+        protocol,
+        "t",
+        "rn",
+        output_index_col,
+        lock_filter,
+    )?;
     let mut stmt_select_notes = conn.prepare_cached(&format!(
         "WITH eligible AS (
              SELECT
@@ -824,6 +906,7 @@ where
              AND rn.id NOT IN rarray(:exclude)
              AND rn.id NOT IN ({}) -- the note is not spent
              AND ({eligible_condition}) -- the note is eligible under the lock filter
+             AND ({reservation_condition}) -- not an active migration source reservation
              GROUP BY rn.id
          )
          SELECT id, txid, {output_index_col},

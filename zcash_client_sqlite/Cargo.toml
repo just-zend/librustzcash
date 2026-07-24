@@ -70,6 +70,8 @@ static_assertions.workspace = true
 
 # - Shielded protocols
 orchard = { workspace = true, optional = true }
+pczt = { workspace = true, optional = true }
+zcash_note_encryption = { workspace = true, optional = true }
 sapling.workspace = true
 
 # - Transparent protocol
@@ -89,6 +91,7 @@ regex = { workspace = true }
 
 # Dependencies used internally:
 # (Breaking upgrades to these are usually backwards-compatible, but check MSRVs.)
+blake2b_simd = { workspace = true, optional = true }
 document-features.workspace = true
 maybe-rayon.workspace = true
 rand_core.workspace = true
@@ -123,6 +126,7 @@ zcash_address = { workspace = true, features = ["test-dependencies"] }
 # The backend's shared conformance suite and proptest strategies, so the pool-migration store is
 # exercised by the ONE per-store framework instead of hand-rolled fixtures.
 zcash_pool_migration = { workspace = true, features = ["test-dependencies"] }
+zcash_pool_migration_memory = { path = "../zcash_pool_migration_memory" }
 zip321 = { workspace = true }
 
 [features]
@@ -134,7 +138,21 @@ multicore = ["maybe-rayon/threads", "zcash_primitives/multicore"]
 
 ## Enables support for storing data related to the sending and receiving of
 ## Orchard funds.
-orchard = ["dep:orchard", "zcash_client_backend/orchard", "zcash_keys/orchard"]
+orchard = [
+    "dep:orchard",
+    "zcash_client_backend/orchard",
+    "zcash_keys/orchard",
+]
+
+## Enables Zend's additive crash-safe migration delivery/runtime schema and APIs. This remains
+## opt-in so ordinary Orchard SQLite consumers retain the upstream dependency and schema surface.
+migration-delivery = [
+    "orchard",
+    "dep:blake2b_simd",
+    "dep:pczt",
+    "dep:zcash_note_encryption",
+    "zcash_pool_migration/wallet",
+]
 
 ## Exposes APIs that are useful for testing, such as `proptest` strategies.
 test-dependencies = [

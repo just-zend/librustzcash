@@ -39,6 +39,15 @@ workspace.
   `LockedInputPolicy` override (`SpendPolicy::with_locked_input_policy`) so it
   may draw on the migration's own locked notes without disturbing any other
   flow's locks.
+- `zcash_client_sqlite::pool_migration::PoolMigrations` implements atomic
+  migration input reservation: exact Orchard output locks and owner-bearing
+  migration state commit or roll back together, and terminal persistence
+  releases only locks owned by that migration.
+- The Zend crash-safe migration delivery runtime is available behind the new
+  opt-in `migration-delivery` feature. It implies `orchard`, PCZT extraction,
+  and the wallet-backed migration adapter without expanding the existing
+  upstream `orchard` feature or installing Zend delivery tables for ordinary
+  SQLite consumers.
 - A database migration adds `lock_expiry_height` and `lock_owner` columns to the
   `sapling_received_notes`, `orchard_received_notes`, `ironwood_received_notes`,
   and `transparent_received_outputs` tables to support explicit note locking

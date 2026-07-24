@@ -24,6 +24,8 @@ extern crate std;
 
 #[cfg(feature = "orchard")]
 pub mod build;
+#[cfg(feature = "wallet")]
+pub mod delivery;
 pub mod engine;
 pub mod note_splitting;
 pub mod preparation;

@@ -25,6 +25,8 @@ libm.workspace = true
 rand_core.workspace = true
 zcash_primitives.workspace = true
 zcash_protocol.workspace = true
+zcash_encoding = { workspace = true, optional = true }
+blake2b_simd = { workspace = true, optional = true }
 
 # Enabled by the `test-dependencies` feature: the `testing` module's proptest strategies and
 # conformance suite, reusable by downstream store crates.
@@ -57,7 +59,7 @@ rusqlite.workspace = true
 shardtree.workspace = true
 tempfile.workspace = true
 zcash_client_backend = { workspace = true, features = ["orchard", "test-dependencies"] }
-zcash_client_sqlite = { workspace = true, features = ["orchard", "test-dependencies"] }
+zcash_client_sqlite = { workspace = true, features = ["migration-delivery", "test-dependencies"] }
 zcash_proofs.workspace = true
 
 # The `local-consensus` feature exposes `LocalNetwork`, used to build the migration transactions
@@ -81,6 +83,9 @@ orchard = ["dep:orchard", "dep:pczt"]
 ## migration wallet with no hand-wired crypto. Implies `orchard`.
 wallet = [
     "orchard",
+    "pczt/tx-extractor",
+    "dep:blake2b_simd",
+    "dep:zcash_encoding",
     "dep:zcash_client_backend",
     "dep:zcash_keys",
     "dep:shardtree",
@@ -101,6 +106,14 @@ test-dependencies = [
 ## under `--all-features`, this is on exactly when the wallet crates' `transparent-inputs` is, which
 ## is the only build that compiles that test (it needs `wallet` too).
 transparent-inputs = []
+## Tracks `zcash_primitives`' ZIP 233 feature so test transaction constructors use the same
+## feature-gated argument list as the dependency under workspace and package-scoped builds.
+zip-233 = [
+    "pczt?/zip-233",
+    "zcash_client_backend?/zip-233",
+    "zcash_client_sqlite/zip-233",
+    "zcash_primitives/zip-233",
+]
 
 [lints]
 workspace = true

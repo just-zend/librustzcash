@@ -761,8 +761,18 @@ mod tests {
     use zcash_protocol::value::Zatoshis;
 
     pub(crate) fn describe_tables(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+        // Zend delivery-control tables are additive to the canonical wallet schema and have their
+        // own byte-for-byte provenance validation in `pool_migration::orchard_ironwood`. Keep this
+        // upstream schema snapshot scoped to the canonical tables it is intended to pin.
+        let query = if cfg!(feature = "migration-delivery") {
+            "SELECT sql FROM sqlite_schema
+              WHERE type = 'table' AND tbl_name NOT GLOB 'zend_*'
+              ORDER BY tbl_name"
+        } else {
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' ORDER BY tbl_name"
+        };
         let result = conn
-            .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' ORDER BY tbl_name")?
+            .prepare(query)?
             .query_and_then([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -892,7 +902,15 @@ mod tests {
             .wallet()
             .db()
             .conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND sql != '' ORDER BY tbl_name, name")
+            .prepare(if cfg!(feature = "migration-delivery") {
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'index' AND sql != '' AND tbl_name NOT GLOB 'zend_*'
+                  ORDER BY tbl_name, name"
+            } else {
+                "SELECT sql FROM sqlite_master
+                  WHERE type = 'index' AND sql != ''
+                  ORDER BY tbl_name, name"
+            })
             .unwrap();
         let mut rows = indices_query.query([]).unwrap();
         let mut expected_idx = 0;

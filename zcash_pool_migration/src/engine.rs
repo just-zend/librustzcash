@@ -296,9 +296,9 @@ pub struct MigrationTransaction {
     /// `LockOwner::new()` round-trip) — carried here as an opaque `[u8; 32]` rather than the typed
     /// `LockOwner` because this `orchard`-gated engine module must not depend on
     /// `zcash_client_backend` (only `wallet`-feature code does); the conversion to/from `LockOwner`
-    /// happens at that boundary, not here. The migration flow does not yet acquire locks, so every
-    /// transaction the engine itself builds carries `None`; a store still round-trips whatever a
-    /// caller sets.
+    /// happens at that boundary, not here. The pool-agnostic engine builds transactions with
+    /// `None`; the `wallet` feature's `LockedWalletMigration` attaches the durable owner while
+    /// atomically reserving their exact inputs, and a store round-trips it unchanged.
     #[getset(get_copy = "pub")]
     pub(crate) lock_owner: Option<[u8; 32]>,
 }
@@ -504,6 +504,19 @@ impl MigrationState {
     /// buffer), so a store persists only the note split.
     pub fn funding_notes(&self) -> Vec<Zatoshis> {
         self.note_split.migration_outputs()
+    }
+
+    /// Returns the value that the given migration transaction makes visible as it crosses into the
+    /// destination pool.
+    ///
+    /// A transfer's `crossing` index addresses the canonical crossing-denomination list retained in
+    /// this state. Preparation transactions do not cross value, and a transfer whose stored index is
+    /// outside that list is malformed, so both cases return `None`.
+    pub fn transfer_amount(&self, transaction: &MigrationTransaction) -> Option<Zatoshis> {
+        transaction
+            .kind()
+            .transfer_crossing()
+            .and_then(|crossing| self.note_split.crossing_values().get(crossing).copied())
     }
 
     /// Replace transfer `id`'s stored PCZT with its proven bytes and move it to
@@ -1143,7 +1156,7 @@ pub enum CommitError<E> {
     Serialize(pczt::EncodingError),
     /// NU6.3 is not active on this network, so there is no destination pool to migrate into. The
     /// planning side models the same recoverable condition as
-    /// [`MigrationError::Nu63NotActive`](MigrationError::Nu63NotActive).
+    /// [`MigrationError::Nu63NotActive`].
     Nu63NotActive,
     /// No committed migration was found to build the transfers for (nothing was loaded from storage).
     NoMigrationInProgress,
@@ -1443,6 +1456,62 @@ impl<E: fmt::Display> fmt::Display for RebuildError<E> {
 #[cfg(feature = "orchard")]
 impl<E: core::error::Error> core::error::Error for RebuildError<E> {}
 
+/// Opaque proof that an expired transfer successor was derived by the upstream rebuild engine.
+///
+/// The private binding covers the exact predecessor, exact successor, target transaction, and
+/// signing mode. Delivery-control code consumes this value when sealing its CAS request; callers
+/// can inspect neither replace nor fabricate any of those authoritative parts.
+#[cfg(feature = "orchard")]
+#[derive(Clone)]
+pub struct RebuiltTransferSuccessor {
+    #[cfg_attr(not(feature = "wallet"), allow(dead_code))]
+    predecessor_state: MigrationState,
+    #[cfg_attr(not(feature = "wallet"), allow(dead_code))]
+    successor_state: MigrationState,
+    transaction_id: MigrationTxId,
+    external_signer: bool,
+}
+
+#[cfg(feature = "orchard")]
+impl fmt::Debug for RebuiltTransferSuccessor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RebuiltTransferSuccessor")
+            .field("predecessor_state", &"<redacted>")
+            .field("successor_state", &"<redacted>")
+            .field("transaction_id", &self.transaction_id)
+            .field("external_signer", &self.external_signer)
+            .finish()
+    }
+}
+
+#[cfg(feature = "orchard")]
+impl RebuiltTransferSuccessor {
+    #[cfg_attr(not(feature = "wallet"), allow(dead_code))]
+    pub(crate) fn into_parts(self) -> (MigrationState, MigrationState, MigrationTxId, bool) {
+        (
+            self.predecessor_state,
+            self.successor_state,
+            self.transaction_id,
+            self.external_signer,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        predecessor_state: MigrationState,
+        successor_state: MigrationState,
+        transaction_id: MigrationTxId,
+        external_signer: bool,
+    ) -> Self {
+        Self {
+            predecessor_state,
+            successor_state,
+            transaction_id,
+            external_signer,
+        }
+    }
+}
+
 /// Rebuild an EXPIRED migration transfer as an entirely NEW pre-signed transaction, signed anew
 /// IN-PROCESS with the wallet's spend authority and stored back in the transfer's slot as
 /// [`Signed`](MigrationTxState::Signed), with a fresh boundary anchor and canonical expiry and an
@@ -1494,6 +1563,27 @@ where
     rebuild_expired_transfer_inner(params, backend, state, id, rng, Signing::InProcess).map(|_| ())
 }
 
+/// Rebuilds an expired transfer exactly as [`rebuild_expired_transfer`], and additionally returns
+/// an opaque binding between the exact predecessor and engine-derived successor. Delivery stores
+/// consume this capability to authorize a narrow compare-and-swap without changing the upstream
+/// rebuild API.
+#[cfg(feature = "orchard")]
+pub fn rebuild_expired_transfer_with_successor<P, B, R>(
+    params: &P,
+    backend: &B,
+    state: &mut MigrationState,
+    id: MigrationTxId,
+    rng: &mut R,
+) -> Result<RebuiltTransferSuccessor, RebuildError<<B as MigrationBackend>::Error>>
+where
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend + MigrationCrypto<Error = <B as MigrationBackend>::Error>,
+    R: RngCore + rand_core::CryptoRng,
+{
+    rebuild_expired_transfer_inner(params, backend, state, id, rng, Signing::InProcess)
+        .map(|(_, successor)| successor)
+}
+
 /// Rebuild an EXPIRED migration transfer for an EXTERNAL signer: construct the same entirely new
 /// transaction as [`rebuild_expired_transfer`], but leave it UNSIGNED in the
 /// [`AwaitingSignature`](MigrationTxState::AwaitingSignature) state and return it as an
@@ -1520,8 +1610,38 @@ where
     B: MigrationBackend + MigrationCrypto<Error = <B as MigrationBackend>::Error>,
     R: RngCore + rand_core::CryptoRng,
 {
-    rebuild_expired_transfer_inner(params, backend, state, id, rng, Signing::External)
-        .map(|unsigned| unsigned.expect("the external signing path always returns the unsigned tx"))
+    rebuild_expired_transfer_inner(params, backend, state, id, rng, Signing::External).map(
+        |(unsigned, _)| unsigned.expect("the external signing path always returns the unsigned tx"),
+    )
+}
+
+/// Rebuilds an expired transfer exactly as [`rebuild_expired_transfer_unsigned`], and additionally
+/// returns an opaque binding between the exact predecessor and engine-derived successor for a
+/// delivery store's narrow compare-and-swap.
+#[cfg(feature = "orchard")]
+pub fn rebuild_expired_transfer_unsigned_with_successor<P, B, R>(
+    params: &P,
+    backend: &B,
+    state: &mut MigrationState,
+    id: MigrationTxId,
+    rng: &mut R,
+) -> Result<
+    (UnsignedMigrationTx, RebuiltTransferSuccessor),
+    RebuildError<<B as MigrationBackend>::Error>,
+>
+where
+    P: zcash_protocol::consensus::Parameters,
+    B: MigrationBackend + MigrationCrypto<Error = <B as MigrationBackend>::Error>,
+    R: RngCore + rand_core::CryptoRng,
+{
+    rebuild_expired_transfer_inner(params, backend, state, id, rng, Signing::External).map(
+        |(unsigned, successor)| {
+            (
+                unsigned.expect("the external signing path always returns the unsigned tx"),
+                successor,
+            )
+        },
+    )
 }
 
 /// Shared body of [`rebuild_expired_transfer`] (with [`Signing::InProcess`]) and
@@ -1535,12 +1655,17 @@ fn rebuild_expired_transfer_inner<P, B, R>(
     id: MigrationTxId,
     rng: &mut R,
     signing: Signing,
-) -> Result<Option<UnsignedMigrationTx>, RebuildError<<B as MigrationBackend>::Error>>
+) -> Result<
+    (Option<UnsignedMigrationTx>, RebuiltTransferSuccessor),
+    RebuildError<<B as MigrationBackend>::Error>,
+>
 where
     P: zcash_protocol::consensus::Parameters,
     B: MigrationBackend + MigrationCrypto<Error = <B as MigrationBackend>::Error>,
     R: RngCore + rand_core::CryptoRng,
 {
+    let predecessor_state = state.clone();
+    let external_signer = matches!(signing, Signing::External);
     // The height of the next block this transfer could be mined into, against which expiry is judged.
     let target_height = backend.chain_tip_height().map_err(RebuildError::Backend)? + 1;
 
@@ -1596,30 +1721,25 @@ where
             RebuildError::InconsistentPlan(format!("no funding value for transfer {crossing}"))
         })?;
 
-    // Recover the funding note's IDENTITY from the expired PCZT itself: its one real spend (the
-    // action with no witness; ZIP 374 deferral leaves the padding dummy its arbitrary witness)
-    // reveals the nullifier of the exact note this part is funded by. Denominations repeat across
-    // a migration, so matching the wallet's spendable notes by value alone could grab a sibling
-    // transfer's funding note and turn the rebuilt transfer into a double-spend of that
-    // still-valid sibling.
+    // Recover the funding note's IDENTITY from the expired PCZT itself by matching its action
+    // nullifiers against the wallet's same-denomination candidates. This survives proving, which
+    // fills the real spend's formerly deferred witness and makes witness presence unusable as a
+    // durable real-vs-padding discriminator. Denominations repeat across a migration, so matching
+    // by value alone could grab a sibling transfer's funding note and turn the rebuilt transfer
+    // into a double-spend of that still-valid sibling.
     let stored_pczt = pczt::Pczt::parse(&tx.pczt).map_err(|e| {
         RebuildError::InconsistentPlan(format!("the stored transfer PCZT does not parse: {e:?}"))
     })?;
-    let mut real_spend_nullifiers = stored_pczt
-        .orchard()
-        .actions()
+    let source_actions = stored_pczt.orchard().actions();
+    if source_actions.len() != crate::note_splitting::SOURCE_ACTIONS_PER_TRANSFER {
+        return Err(RebuildError::InconsistentPlan(
+            "the stored transfer PCZT does not have the canonical source action count".into(),
+        ));
+    }
+    let action_nullifiers: alloc::collections::BTreeSet<[u8; 32]> = source_actions
         .iter()
-        .filter(|a| a.spend().witness().is_none())
-        .map(|a| *a.spend().nullifier());
-    let funding_nullifier = match (real_spend_nullifiers.next(), real_spend_nullifiers.next()) {
-        (Some(nf), None) => nf,
-        _ => {
-            return Err(RebuildError::InconsistentPlan(
-                "the stored transfer PCZT does not have exactly one real (unwitnessed) spend"
-                    .into(),
-            ));
-        }
-    };
+        .map(|action| *action.spend().nullifier())
+        .collect();
 
     // The exact note must still be among the wallet's spendable notes; if it is gone (spent
     // outside the migration), the remaining balance must be re-planned rather than this part
@@ -1628,7 +1748,7 @@ where
     let spendable_values = backend
         .spendable_orchard_note_values()
         .map_err(RebuildError::Backend)?;
-    let mut note = None;
+    let mut matches = Vec::new();
     for (index, value) in spendable_values.iter().enumerate() {
         if *value != funding_value {
             continue;
@@ -1636,12 +1756,19 @@ where
         let candidate = backend
             .resolve_wallet_note(index)
             .map_err(RebuildError::Backend)?;
-        if candidate.nullifier(&fvk).to_bytes() == funding_nullifier {
-            note = Some(candidate);
-            break;
+        if action_nullifiers.contains(&candidate.nullifier(&fvk).to_bytes()) {
+            matches.push(candidate);
         }
     }
-    let note = note.ok_or(RebuildError::FundingNoteUnavailable(funding_value))?;
+    let note = match matches.as_slice() {
+        [note] => *note,
+        [] => return Err(RebuildError::FundingNoteUnavailable(funding_value)),
+        _ => {
+            return Err(RebuildError::InconsistentPlan(
+                "more than one wallet note matches the stored transfer action nullifiers".into(),
+            ));
+        }
+    };
 
     // Reschedule the part with a fresh memoryless delay from the current tip, and derive its new
     // canonical expiry and a fresh boundary anchor for that schedule.
@@ -1694,7 +1821,15 @@ where
     tx.expiry_height = expiry_height;
     tx.anchor_boundary = Some(anchor_boundary);
     tx.state = new_state;
-    Ok(unsigned)
+    Ok((
+        unsigned,
+        RebuiltTransferSuccessor {
+            predecessor_state,
+            successor_state: state.clone(),
+            transaction_id: id,
+            external_signer,
+        },
+    ))
 }
 
 /// How a freshly built migration PCZT is finished by the commit functions: signed in-process with the
@@ -1988,6 +2123,7 @@ struct Committer<'a, P, B, R> {
     /// prover needs it at proving time to locate the note in the wallet's commitment tree (in
     /// production the wallet finds it by nullifier in its own note store). Surfaced through
     /// [`commit_preparation_with_funding`]; the normal commit path drops it.
+    #[cfg(any(test, feature = "test-dependencies"))]
     transfer_funding: TransferFunding,
 }
 
@@ -2035,6 +2171,7 @@ where
             next_id: 0,
             layer_ids: Vec::new(),
             minted: Vec::new(),
+            #[cfg(any(test, feature = "test-dependencies"))]
             transfer_funding: Vec::new(),
         })
     }
@@ -2184,8 +2321,8 @@ where
                     expiry_height,
                     anchor_boundary: None,
                     state: tx_state,
-                    // The engine does not yet acquire locks; a later slice that draws a
-                    // `LockOwner` for the commit would set this here.
+                    // The pool-agnostic engine does not depend on wallet locking. The locked wallet
+                    // adapter attaches its durable owner at the atomic persistence boundary.
                     lock_owner: None,
                 });
             }
@@ -2337,10 +2474,11 @@ where
                 expiry_height: schedule.expiry_height(),
                 anchor_boundary: Some(anchor_boundary),
                 state: tx_state,
-                // The engine does not yet acquire locks; a later slice that draws a
-                // `LockOwner` for the commit would set this here.
+                // The pool-agnostic engine does not depend on wallet locking. The locked wallet
+                // adapter attaches its durable owner at the atomic persistence boundary.
                 lock_owner: None,
             });
+            #[cfg(any(test, feature = "test-dependencies"))]
             self.transfer_funding.push((id, note));
         }
         Ok(())
@@ -2359,6 +2497,7 @@ where
         CommitOutput {
             state,
             unsigned: self.unsigned,
+            #[cfg(any(test, feature = "test-dependencies"))]
             transfer_funding: self.transfer_funding,
         }
     }
@@ -2367,7 +2506,7 @@ where
 /// Each transfer paired with the funding note it spends, recovered from the built preparation
 /// bundles during a commit pass. A prover needs it to locate each transfer's spend in the wallet's
 /// commitment tree at proving time.
-#[cfg(feature = "orchard")]
+#[cfg(all(feature = "orchard", any(test, feature = "test-dependencies")))]
 type TransferFunding = Vec<(MigrationTxId, orchard::note::Note)>;
 
 /// What one commit pass produces. The public commit entry points drop the parts they do not
@@ -2376,6 +2515,7 @@ type TransferFunding = Vec<(MigrationTxId, orchard::note::Note)>;
 struct CommitOutput {
     state: MigrationState,
     unsigned: Vec<UnsignedMigrationTx>,
+    #[cfg(any(test, feature = "test-dependencies"))]
     transfer_funding: TransferFunding,
 }
 
@@ -2731,6 +2871,25 @@ mod tests {
             preparation: crate::preparation::PreparationPlan::from_parts(Vec::new(), Vec::new()),
             transactions: vec![tx],
         };
+
+        assert_eq!(
+            state.transfer_amount(&state.transactions[0]),
+            state.note_split.crossing_values().first().copied(),
+            "a transfer exposes its canonical crossing denomination, not its fee-funded note value",
+        );
+        let preparation = MigrationTransaction {
+            kind: MigrationTxKind::Preparation { layer: 0, index: 0 },
+            ..state.transactions[0].clone()
+        };
+        assert_eq!(state.transfer_amount(&preparation), None);
+        let malformed = MigrationTransaction {
+            kind: MigrationTxKind::Transfer {
+                crossing: state.note_split.crossing_values().len(),
+            },
+            ..state.transactions[0].clone()
+        };
+        assert_eq!(state.transfer_amount(&malformed), None);
+
         backend.replace_migration(&state).unwrap();
 
         // The stored transactions round-trip, and a state update persists.

@@ -7,6 +7,9 @@ PCZTs, schedules them by block height, and persists its state through a wallet
 backend; the consuming application broadcasts the transactions and reports results
 back.
 
+Zend's capability mapping and the retirement plan for the former standalone migration
+crate are recorded in [CONSOLIDATION.md](CONSOLIDATION.md).
+
 ## License
 
 Licensed under either of
