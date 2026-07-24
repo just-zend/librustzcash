@@ -73,6 +73,7 @@ pub(super) static TABLES: Tables = Tables {
     delivery_attempt_archive: "zend_orchard_ironwood_delivery_attempt_archive",
     delivery_run_archive: "zend_orchard_ironwood_delivery_run_archive",
     immediate_delivery: "zend_orchard_ironwood_immediate_delivery",
+    immediate_gross_authorization: "zend_orchard_ironwood_immediate_gross_authorization",
     immediate_lease_index: "idx_zend_orchard_ironwood_immediate_lease",
     legacy_quarantine: "zend_ironwood_legacy_quarantine",
 };
@@ -92,6 +93,34 @@ pub(crate) fn init_delivery_control_tables(conn: &Connection) -> rusqlite::Resul
     store::init_delivery_control(conn, &TABLES)?;
     store::quarantine_legacy_engine_state(conn, &TABLES)?;
     Ok(())
+}
+
+/// Creates the current delivery-control schema directly for focused runtime tests. Production
+/// wallets reach this shape only by replaying the immutable v1 node and its v2 successor.
+#[cfg(all(feature = "migration-delivery", test))]
+pub(crate) fn init_current_delivery_control_tables(conn: &Connection) -> rusqlite::Result<()> {
+    store::init_current_delivery_control(conn, &TABLES)?;
+    store::quarantine_legacy_engine_state(conn, &TABLES)?;
+    Ok(())
+}
+
+/// Upgrades the delivery schema from the exact v1 implementation to v2 by adding the durable
+/// immediate gross-authorization boundary. Existing immediate rows intentionally receive no
+/// authorization record: only new user-confirmed reservations may create one.
+#[cfg(feature = "migration-delivery")]
+pub(crate) fn upgrade_immediate_gross_authorization(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), Error> {
+    store::upgrade_immediate_gross_authorization(transaction, &TABLES)
+}
+
+/// Validates the installed delivery schema using the same runtime provenance checks as wallet
+/// operations. Kept crate-private for migration integration tests and startup diagnostics.
+#[cfg(all(feature = "migration-delivery", test))]
+pub(crate) fn delivery_schema_provenance(
+    conn: &Connection,
+) -> Result<zcash_pool_migration::delivery::DeliverySchemaProvenance, Error> {
+    store::delivery_schema_provenance(conn, &TABLES)
 }
 
 /// Returns whether the exact current Zend delivery schema and all of its authority relations are
@@ -596,7 +625,13 @@ impl<C: BorrowMut<Connection>> PoolMigrationLockStore for PoolMigrations<C> {
 mod tests {
     use super::{PoolMigrations, init_migration_tables};
     #[cfg(feature = "migration-delivery")]
-    use super::{init_delivery_control_tables, prepare_for_wallet_rewind};
+    use super::{
+        TABLES, init_current_delivery_control_tables as init_delivery_control_tables,
+        init_delivery_control_tables as init_delivery_control_v1_tables, prepare_for_wallet_rewind,
+        upgrade_immediate_gross_authorization,
+    };
+    #[cfg(feature = "migration-delivery")]
+    use crate::pool_migration::ImmediateDeliveryWriteTransaction;
     #[cfg(feature = "migration-delivery")]
     use crate::pool_migration::store;
 
@@ -630,10 +665,15 @@ mod tests {
             "CREATE TABLE accounts (
                  id INTEGER PRIMARY KEY,
                  uuid BLOB NOT NULL,
-                 ufvk BLOB DEFAULT X'00'
+                 ufvk BLOB DEFAULT X'00',
+                 birthday_height INTEGER
              );
              CREATE UNIQUE INDEX accounts_uuid ON accounts (uuid);
-             CREATE TABLE scan_queue (block_range_end INTEGER NOT NULL);
+             CREATE TABLE scan_queue (
+                 block_range_start INTEGER NOT NULL DEFAULT 0,
+                 block_range_end INTEGER NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 10
+             );
              INSERT INTO scan_queue (block_range_end) VALUES (101);
              CREATE TABLE transactions (
                  id_tx INTEGER PRIMARY KEY,
@@ -742,6 +782,25 @@ mod tests {
         let conn = fresh_conn();
         let account = insert_account(&conn);
         PoolMigrations::for_account(conn, account).expect("account exists")
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    fn immediate_delivery_write<T>(
+        conn: &Connection,
+        operation: impl FnOnce(&ImmediateDeliveryWriteTransaction<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let transaction = ImmediateDeliveryWriteTransaction::begin(conn)?;
+        let result = operation(&transaction);
+        match result {
+            Ok(value) => {
+                transaction.commit()?;
+                Ok(value)
+            }
+            Err(error) => {
+                transaction.rollback()?;
+                Err(error)
+            }
+        }
     }
 
     #[cfg(feature = "migration-delivery")]
@@ -1288,6 +1347,13 @@ mod tests {
         )
         .unwrap();
         conn.execute(
+            "INSERT INTO zend_orchard_ironwood_immediate_gross_authorization
+                 (run_identity, authorization_version, maximum_gross_amount)
+             VALUES (?, 1, 0)",
+            rusqlite::params![immediate_run],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO zend_orchard_ironwood_delivery_reservations (
                  run_identity, source_txid, source_index, status, released_tip_height
              ) VALUES (?, ?, 1, 'abandoned', 0)",
@@ -1331,6 +1397,7 @@ mod tests {
             "zend_orchard_ironwood_delivery_reservations",
             "zend_orchard_ironwood_delivery_evidence",
             "zend_orchard_ironwood_immediate_delivery",
+            "zend_orchard_ironwood_immediate_gross_authorization",
         ] {
             let remaining: u64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -1348,6 +1415,1788 @@ mod tests {
             .unwrap()
             .is_some();
         assert!(!fk_violation);
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    #[test]
+    fn failed_immediate_materialization_reacquisition_is_exact_and_account_scoped() {
+        use prost::Message;
+        use rand::rngs::OsRng;
+        use zcash_client_backend::{
+            proto::proposal::{self, proposed_input},
+            wallet::LockOwner,
+        };
+        use zcash_pool_migration::delivery::{
+            ClaimKind, ClaimStatus, ClaimToken, DeliveryArtifactIdentity, DeliveryFailureReason,
+            DeliveryRevision, ExternalSigningPczt, ImmediateArtifactEvidence,
+            ImmediateArtifactIdentity, ImmediateMigrationDeliveryStore, ImmediateProposal,
+            ImmediateProposalPayload, LeaseDuration, LoopbackDevelopmentEndpoint,
+            MigrationRunIdentity, SignerOwnership, SourceReservationOwner, SubmissionContext,
+            SubmissionOutcome, SubmissionPolicy, SubmissionPolicyRequest, SubmissionTransport,
+            exact_immediate_transaction,
+        };
+        use zcash_primitives::transaction::{
+            Authorized, TransactionData, builder::DEFAULT_TX_EXPIRY_DELTA,
+        };
+        use zcash_protocol::{
+            consensus::{BlockHeight, BranchId},
+            value::Zatoshis,
+        };
+
+        /// A stable height at which the test network has an active transaction branch.
+        const TEST_TARGET_HEIGHT: u32 = 120;
+        /// A bounded retry lease; only Rust interprets it as materialization authority.
+        const TEST_LEASE_MILLIS: u64 = 5_000;
+        /// Gross Orchard value committed by the persisted canonical proposal.
+        const TEST_GROSS_AMOUNT: u64 = 100_000;
+        /// Distinct test-only identifier byte for the proposal source transaction.
+        const TEST_SOURCE_TXID_BYTE: u8 = 0x53;
+        /// Distinct test-only identifier byte for the wallet lock owner.
+        const TEST_LOCK_OWNER_BYTE: u8 = 0x52;
+        /// Largest revision representable by the SQLite delivery schema.
+        const MAX_PERSISTED_DELIVERY_REVISION: u64 = i64::MAX as u64;
+        type StableImmediateAuthority = (Vec<u8>, Vec<u8>, Vec<u8>, String, Vec<u8>, Vec<u8>);
+        type RetryMutableState = (u64, String, Option<String>, Option<Vec<u8>>);
+
+        let mut conn = fresh_conn();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_delivery_control_v1_tables(&conn).expect("historical delivery schema");
+        let account = insert_account(&conn);
+        let foreign_account = insert_account(&conn);
+        let account_id: i64 = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE uuid = ?",
+                rusqlite::params![account.expose_uuid()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let foreign_account_id: i64 = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE uuid = ?",
+                rusqlite::params![foreign_account.expose_uuid()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let source = insert_lockable_output(&conn, account, TEST_SOURCE_TXID_BYTE);
+
+        let params = zcash_pool_migration_memory::regtest_network(true);
+        let context = SubmissionContext::from_parameters(&params);
+        let transport = SubmissionTransport::LoopbackDevelopment(
+            LoopbackDevelopmentEndpoint::try_from("http://127.0.0.1:9067".to_owned()).unwrap(),
+        );
+        let policy =
+            SubmissionPolicy::validate(SubmissionPolicyRequest::new(context, transport), context)
+                .expect("test policy");
+        let target_height = BlockHeight::from_u32(TEST_TARGET_HEIGHT);
+        let payload = proposal::Proposal {
+            steps: vec![proposal::ProposalStep {
+                inputs: vec![proposal::ProposedInput {
+                    value: Some(proposed_input::Value::ReceivedOutput(
+                        proposal::ReceivedOutput {
+                            txid: source.txid().as_ref().to_vec(),
+                            value_pool: proposal::ValuePool::Orchard.into(),
+                            index: 0,
+                            value: TEST_GROSS_AMOUNT,
+                        },
+                    )),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let proposal = ImmediateProposal::new(
+            target_height,
+            BlockHeight::from_u32(TEST_TARGET_HEIGHT + DEFAULT_TX_EXPIRY_DELTA),
+            BranchId::for_height(&params, target_height),
+            ImmediateProposalPayload::try_from(payload).unwrap(),
+        )
+        .expect("test proposal envelope");
+        let artifact_identity = ImmediateArtifactIdentity::random(&mut OsRng);
+        let evidence = ImmediateArtifactEvidence::from_proposal(artifact_identity, &proposal);
+        let run_identity = MigrationRunIdentity::random(&mut OsRng);
+        let source_owner = SourceReservationOwner::random(&mut OsRng);
+        let lock_owner = LockOwner::new([TEST_LOCK_OWNER_BYTE; 32]);
+        conn.execute(
+            "UPDATE orchard_received_notes
+                SET lock_expiry_height = ?, lock_owner = ?
+              WHERE transaction_id = (SELECT id_tx FROM transactions WHERE txid = ?)
+                AND action_index = ?",
+            rusqlite::params![
+                u32::from(evidence.expiry_height()),
+                lock_owner.as_bytes(),
+                source.txid().as_ref(),
+                source.output_index(),
+            ],
+        )
+        .unwrap();
+        let lock_before_upgrade = output_lock(&conn, &source);
+        let authority = store::delivery_run_authority_fingerprint(
+            run_identity.as_bytes(),
+            account_id,
+            "immediate",
+            None,
+            source_owner.as_bytes(),
+            Some(lock_owner.as_bytes()),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zend_orchard_ironwood_delivery_runs (
+                 run_identity, account_id, lane, source_owner, canonical_lock_owner,
+                 authority_fingerprint, status
+             ) VALUES (?, ?, 'immediate', ?, ?, ?, 'active')",
+            rusqlite::params![
+                run_identity.as_bytes(),
+                account_id,
+                source_owner.as_bytes(),
+                lock_owner.as_bytes(),
+                authority,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zend_orchard_ironwood_immediate_delivery (
+                 run_identity, revision, phase, artifact_identity, proposal_fingerprint,
+                 canonical_proposal, signer_ownership, status, last_error, expiry_height,
+                 policy, policy_fingerprint
+             ) VALUES (?, 1, 'active', ?, ?, ?, 'sdk', 'materialization_failed',
+                       'materialization_failed', ?, ?, ?)",
+            rusqlite::params![
+                run_identity.as_bytes(),
+                artifact_identity.as_bytes(),
+                evidence.proposal_digest().as_bytes(),
+                evidence.canonical_proposal(),
+                u32::from(evidence.expiry_height()),
+                policy.canonical_bytes(),
+                policy.fingerprint().as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zend_orchard_ironwood_delivery_reservations (
+                 run_identity, source_txid, source_index, status
+            ) VALUES (?, ?, 0, 'active')",
+            rusqlite::params![run_identity.as_bytes(), source.txid().as_ref()],
+        )
+        .unwrap();
+        let pre_upgrade_provenance: (u32, String) = conn
+            .query_row(
+                "SELECT schema_version, implementation
+                   FROM zend_orchard_ironwood_delivery_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            pre_upgrade_provenance,
+            (1, "just-zend/librustzcash-delivery-v1".to_owned())
+        );
+        let pre_upgrade_authorization_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                      WHERE name = 'zend_orchard_ironwood_immediate_gross_authorization'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!pre_upgrade_authorization_table);
+        {
+            let transaction = conn.transaction().unwrap();
+            upgrade_immediate_gross_authorization(&transaction).expect("upgrade exact v1 schema");
+            transaction.commit().unwrap();
+        }
+        let upgraded_provenance: (u32, String) = conn
+            .query_row(
+                "SELECT schema_version, implementation
+                   FROM zend_orchard_ironwood_delivery_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            upgraded_provenance,
+            (2, "just-zend/librustzcash-delivery-v2".to_owned())
+        );
+        let fabricated_authorizations: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_gross_authorization",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fabricated_authorizations, 0);
+        assert_eq!(output_lock(&conn, &source), lock_before_upgrade);
+        let (legacy_current, legacy_retained) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .expect("legacy immediate state remains readable after upgrade");
+        assert!(legacy_retained.is_empty());
+        let legacy_snapshot = legacy_current.expect("one live legacy immediate row").0;
+        assert_eq!(legacy_snapshot.immediate_maximum_gross_amount(), None);
+        assert_eq!(
+            legacy_snapshot.storage_finality(),
+            zcash_pool_migration::delivery::StorageFinality::Active,
+            "missing spend authorization is orthogonal to reservation finality",
+        );
+        let legacy_runtime =
+            zcash_pool_migration::delivery::MigrationRuntimeSnapshot::from_observed(
+                None,
+                Some(legacy_snapshot),
+                vec![],
+                zcash_pool_migration::delivery::DeliverySchemaProvenance::Compatible(
+                    zcash_pool_migration::delivery::DeliverySchemaVersion::from_u32(2).unwrap(),
+                ),
+                zcash_pool_migration::delivery::LegacyCutoverStatus::Fresh,
+                zcash_pool_migration::delivery::DestinationSpendability::NotSpendable,
+            );
+        assert_eq!(
+            legacy_runtime.availability(),
+            zcash_pool_migration::delivery::MigrationRuntimeAvailability::Unavailable(
+                zcash_pool_migration::delivery::RuntimeUnavailableReason::MissingSpendAuthorization,
+            )
+        );
+        let active_reservations: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_delivery_reservations
+                  WHERE run_identity = ? AND status = 'active'",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_reservations, 1);
+        let stable_before: StableImmediateAuthority = conn
+            .query_row(
+                "SELECT artifact_identity, proposal_fingerprint, canonical_proposal,
+                        signer_ownership, policy, policy_fingerprint
+                   FROM zend_orchard_ironwood_immediate_delivery WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let lease_duration = LeaseDuration::from_millis(TEST_LEASE_MILLIS).unwrap();
+
+        let wrong_signer = immediate_delivery_write(&conn, |transaction| {
+            store::reacquire_failed_immediate_materialization(
+                transaction,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                SignerOwnership::External,
+                Zatoshis::from_u64(TEST_GROSS_AMOUNT + 1).unwrap(),
+                lease_duration,
+                policy.fingerprint(),
+            )
+        });
+        assert!(
+            matches!(wrong_signer, Err(Error::DeliveryClaimUnavailable)),
+            "unexpected wrong-signer result: {wrong_signer:?}"
+        );
+        assert!(
+            immediate_delivery_write(&conn, |transaction| {
+                store::reacquire_failed_immediate_materialization(
+                    transaction,
+                    &TABLES,
+                    crate::AccountRef(foreign_account_id),
+                    context,
+                    DeliveryRevision::INITIAL,
+                    run_identity,
+                    artifact_identity,
+                    SignerOwnership::Sdk,
+                    Zatoshis::from_u64(TEST_GROSS_AMOUNT + 1).unwrap(),
+                    lease_duration,
+                    policy.fingerprint(),
+                )
+            })
+            .is_err(),
+            "a different account cannot reacquire the claim",
+        );
+        let authorizations_after_invalid_identity: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_gross_authorization",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authorizations_after_invalid_identity, 0);
+
+        let mutable_before: RetryMutableState = conn
+            .query_row(
+                "SELECT revision, status, claim_kind, attempt_token
+                   FROM zend_orchard_ironwood_immediate_delivery WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let over_limit = immediate_delivery_write(&conn, |transaction| {
+            store::reacquire_failed_immediate_materialization(
+                transaction,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                SignerOwnership::Sdk,
+                Zatoshis::from_u64(TEST_GROSS_AMOUNT - 1).unwrap(),
+                lease_duration,
+                policy.fingerprint(),
+            )
+        });
+        assert!(matches!(
+            over_limit,
+            Err(Error::ImmediateAmountLimitExceeded)
+        ));
+        let mutable_after_rejection: RetryMutableState = conn
+            .query_row(
+                "SELECT revision, status, claim_kind, attempt_token
+                   FROM zend_orchard_ironwood_immediate_delivery WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(mutable_after_rejection, mutable_before);
+        let authorizations_after_limit_rejection: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_gross_authorization",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authorizations_after_limit_rejection, 0);
+
+        let read_mutable_state = |conn: &Connection| -> RetryMutableState {
+            conn.query_row(
+                "SELECT revision, status, claim_kind, attempt_token
+                   FROM zend_orchard_ironwood_immediate_delivery WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        let empty_transaction = TransactionData::<Authorized>::from_parts_v6(
+            proposal.branch_id(),
+            133,
+            evidence.expiry_height(),
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
+            Zatoshis::ZERO,
+            None,
+            None,
+            None,
+            None,
+        )
+        .freeze()
+        .unwrap();
+        let exact = exact_immediate_transaction(&evidence, &empty_transaction).unwrap();
+        let staging_token = ClaimToken::random(&mut OsRng);
+        let staging_seal = crate::pool_migration::ValidatedImmediateTransaction {
+            artifact_identity,
+            proposal_digest: evidence.proposal_digest(),
+            exact_digest: exact.digest(),
+            destination_output_index: 0,
+            ironwood_amount: Zatoshis::ZERO,
+        };
+        let state_before_blocked_staging = read_mutable_state(&conn);
+        assert!(matches!(
+            store::stage_immediate_transaction(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                staging_token,
+                &exact,
+                policy.fingerprint(),
+                &staging_seal,
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert_eq!(read_mutable_state(&conn), state_before_blocked_staging);
+        assert!(matches!(
+            store::reacquire_immediate_external_signing(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                lease_duration,
+                policy.fingerprint(),
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        let unsigned_pczt_bytes = pczt::roles::creator::Creator::new(
+            u32::from(proposal.branch_id()),
+            u32::from(evidence.expiry_height()),
+            133,
+            None,
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .serialize()
+        .unwrap();
+        let unsigned_pczt = ExternalSigningPczt::parse(unsigned_pczt_bytes.clone()).unwrap();
+        let signed_pczt = unsigned_pczt.merge_signed(unsigned_pczt_bytes).unwrap();
+        let pczt_seal = crate::pool_migration::ValidatedImmediatePczt {
+            artifact_identity,
+            proposal_digest: evidence.proposal_digest(),
+            pczt_digest: unsigned_pczt.digest(),
+        };
+        assert!(matches!(
+            store::stage_immediate_external_signing_pczt(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                staging_token,
+                &unsigned_pczt,
+                policy.fingerprint(),
+                &pczt_seal,
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert!(matches!(
+            store::stage_immediate_signed_pczt(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                staging_token,
+                &signed_pczt,
+                policy.fingerprint(),
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert_eq!(read_mutable_state(&conn), state_before_blocked_staging);
+        assert!(matches!(
+            store::claim_immediate(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                lease_duration,
+                policy.fingerprint(),
+                ClaimKind::Submission,
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert_eq!(read_mutable_state(&conn), state_before_blocked_staging);
+
+        let materialization_lease =
+            store::checked_delivery_lease(ClaimKind::Materialization, lease_duration).unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET status = 'materializing', last_error = NULL,
+                    claim_kind = 'materialization', attempt_token = ?,
+                    lease_clock_session = ?, lease_acquired_at_ms = ?, lease_expires_at_ms = ?
+              WHERE run_identity = ?",
+            rusqlite::params![
+                materialization_lease.token().as_bytes(),
+                materialization_lease.acquired_at().session().as_bytes(),
+                materialization_lease.acquired_at().tick_millis(),
+                materialization_lease.expires_at().tick_millis(),
+                run_identity.as_bytes(),
+            ],
+        )
+        .unwrap();
+        let materializing_state = read_mutable_state(&conn);
+        assert!(matches!(
+            store::resume_immediate_claim(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                materialization_lease.token(),
+                policy.fingerprint(),
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert!(matches!(
+            store::renew_immediate_claim(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                materialization_lease.token(),
+                lease_duration,
+                policy.fingerprint(),
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert_eq!(read_mutable_state(&conn), materializing_state);
+
+        let released = store::release_immediate_claim_known_unsent(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            DeliveryRevision::INITIAL,
+            run_identity,
+            artifact_identity,
+            materialization_lease.token(),
+            DeliveryFailureReason::MaterializationFailed,
+            policy.fingerprint(),
+        )
+        .expect("known-unsent release remains operable without legacy spend authorization");
+        assert_eq!(
+            released.claims()[0].status(),
+            ClaimStatus::MaterializationFailed
+        );
+        assert_eq!(released.immediate_maximum_gross_amount(), None);
+
+        conn.execute_batch("SAVEPOINT blocked_submission_resume")
+            .unwrap();
+        let submission_lease =
+            store::checked_delivery_lease(ClaimKind::Submission, lease_duration).unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET status = 'submitting', last_error = NULL,
+                    claim_kind = 'submission', attempt_token = ?, lease_clock_session = ?,
+                    lease_acquired_at_ms = ?, lease_expires_at_ms = ?, txid = ?, exact_tx = ?,
+                    exact_tx_digest = ?
+              WHERE run_identity = ?",
+            rusqlite::params![
+                submission_lease.token().as_bytes(),
+                submission_lease.acquired_at().session().as_bytes(),
+                submission_lease.acquired_at().tick_millis(),
+                submission_lease.expires_at().tick_millis(),
+                exact.txid().as_ref(),
+                exact.bytes(),
+                exact.digest().as_bytes(),
+                run_identity.as_bytes(),
+            ],
+        )
+        .unwrap();
+        let submission_state = read_mutable_state(&conn);
+        let submission_revision = released.revision();
+        assert!(matches!(
+            store::resume_immediate_claim(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                submission_revision,
+                run_identity,
+                artifact_identity,
+                submission_lease.token(),
+                policy.fingerprint(),
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert!(matches!(
+            store::renew_immediate_claim(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                submission_revision,
+                run_identity,
+                artifact_identity,
+                submission_lease.token(),
+                lease_duration,
+                policy.fingerprint(),
+            ),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        assert_eq!(read_mutable_state(&conn), submission_state);
+        conn.execute_batch(
+            "ROLLBACK TO blocked_submission_resume; RELEASE blocked_submission_resume",
+        )
+        .unwrap();
+
+        conn.execute_batch("SAVEPOINT allowed_known_unsent_outcome")
+            .unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET status = 'submitting', last_error = NULL,
+                    claim_kind = 'submission', attempt_token = ?, lease_clock_session = ?,
+                    lease_acquired_at_ms = ?, lease_expires_at_ms = ?,
+                    txid = ?, exact_tx = ?, exact_tx_digest = ?
+              WHERE run_identity = ?",
+            rusqlite::params![
+                submission_lease.token().as_bytes(),
+                submission_lease.acquired_at().session().as_bytes(),
+                submission_lease.acquired_at().tick_millis(),
+                submission_lease.expires_at().tick_millis(),
+                exact.txid().as_ref(),
+                exact.bytes(),
+                exact.digest().as_bytes(),
+                run_identity.as_bytes(),
+            ],
+        )
+        .unwrap();
+        let known_unsent = store::record_immediate_submission_outcome(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            submission_revision,
+            run_identity,
+            artifact_identity,
+            submission_lease.token(),
+            SubmissionOutcome::KnownUnsent,
+            policy.fingerprint(),
+        )
+        .expect("known-unsent outcome remains operable without spend authorization");
+        assert_eq!(known_unsent.claims()[0].status(), ClaimStatus::Staged);
+        assert_eq!(
+            known_unsent.revision(),
+            submission_revision.checked_next().unwrap()
+        );
+        assert_eq!(
+            known_unsent.claims()[0]
+                .exact_transaction()
+                .unwrap()
+                .digest(),
+            exact.digest()
+        );
+        conn.execute_batch(
+            "ROLLBACK TO allowed_known_unsent_outcome; RELEASE allowed_known_unsent_outcome",
+        )
+        .unwrap();
+
+        conn.execute_batch("SAVEPOINT allowed_outcome_resolution")
+            .unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET status = 'submitting', last_error = NULL,
+                    claim_kind = 'submission', attempt_token = ?, lease_clock_session = ?,
+                    lease_acquired_at_ms = ?, lease_expires_at_ms = ?,
+                    txid = ?, exact_tx = ?, exact_tx_digest = ?
+              WHERE run_identity = ?",
+            rusqlite::params![
+                submission_lease.token().as_bytes(),
+                submission_lease.acquired_at().session().as_bytes(),
+                submission_lease.acquired_at().tick_millis(),
+                submission_lease.expires_at().tick_millis(),
+                exact.txid().as_ref(),
+                exact.bytes(),
+                exact.digest().as_bytes(),
+                run_identity.as_bytes(),
+            ],
+        )
+        .unwrap();
+        let unknown = store::record_immediate_submission_outcome(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            submission_revision,
+            run_identity,
+            artifact_identity,
+            submission_lease.token(),
+            SubmissionOutcome::Unknown,
+            policy.fingerprint(),
+        )
+        .expect("unknown outcome remains operable without spend authorization");
+        assert_eq!(unknown.claims()[0].status(), ClaimStatus::OutcomeUnknown);
+        assert_eq!(
+            unknown.claims()[0].last_error(),
+            Some(DeliveryFailureReason::TransportOutcomeUnknown)
+        );
+        assert_eq!(
+            unknown.revision(),
+            submission_revision.checked_next().unwrap()
+        );
+        let outcome = store::claim_immediate(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            unknown.revision(),
+            run_identity,
+            artifact_identity,
+            lease_duration,
+            policy.fingerprint(),
+            ClaimKind::OutcomeResolution,
+        )
+        .unwrap()
+        .expect("outcome resolution remains operable without spend authorization");
+        let outcome_claim = &outcome.claims()[0];
+        let outcome_token = outcome_claim.token().unwrap();
+        assert!(
+            store::resume_immediate_claim(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                outcome.revision(),
+                run_identity,
+                artifact_identity,
+                outcome_token,
+                policy.fingerprint(),
+            )
+            .unwrap()
+            .is_some()
+        );
+        let renewed_outcome = store::renew_immediate_claim(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            outcome.revision(),
+            run_identity,
+            artifact_identity,
+            outcome_token,
+            lease_duration,
+            policy.fingerprint(),
+        )
+        .unwrap()
+        .expect("outcome lease renewal remains operable");
+        store::reconcile_immediate_submission(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            renewed_outcome.revision(),
+            run_identity,
+            artifact_identity,
+            outcome_token,
+        )
+        .expect("outcome reconciliation remains operable without spend authorization");
+        conn.execute_batch(
+            "ROLLBACK TO allowed_outcome_resolution; RELEASE allowed_outcome_resolution",
+        )
+        .unwrap();
+
+        conn.execute_batch("SAVEPOINT allowed_abandonment").unwrap();
+        let abandoning = store::begin_immediate_abandonment(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            submission_revision,
+            run_identity,
+        )
+        .expect("safe abandonment remains operable without spend authorization");
+        let abandoned = store::finish_immediate_abandonment(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            abandoning.revision(),
+            run_identity,
+        )
+        .expect("unexposed abandonment can release reservations without spend authorization");
+        assert!(abandoned.released_without_exposure());
+        conn.execute_batch("ROLLBACK TO allowed_abandonment; RELEASE allowed_abandonment")
+            .unwrap();
+
+        conn.execute_batch("SAVEPOINT recovery_required_precedence")
+            .unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET storage_finality = 'recovery_required',
+                    storage_recovery_reason = 'corrupt_finality_evidence'
+              WHERE run_identity = ?",
+            rusqlite::params![run_identity.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_delivery_runs SET status = 'recovery_required'
+              WHERE run_identity = ?",
+            rusqlite::params![run_identity.as_bytes()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_delivery_reservations
+                SET status = 'recovery_required' WHERE run_identity = ?",
+            rusqlite::params![run_identity.as_bytes()],
+        )
+        .unwrap();
+        let (recovery_current, _) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .unwrap();
+        let recovery_snapshot = recovery_current.unwrap().0;
+        assert_eq!(
+            recovery_snapshot.storage_finality(),
+            zcash_pool_migration::delivery::StorageFinality::RecoveryRequired(
+                zcash_pool_migration::delivery::StorageRecoveryReason::CorruptFinalityEvidence,
+            )
+        );
+        let recovery_runtime =
+            zcash_pool_migration::delivery::MigrationRuntimeSnapshot::from_observed(
+                None,
+                Some(recovery_snapshot),
+                vec![],
+                zcash_pool_migration::delivery::DeliverySchemaProvenance::Compatible(
+                    zcash_pool_migration::delivery::DeliverySchemaVersion::from_u32(2).unwrap(),
+                ),
+                zcash_pool_migration::delivery::LegacyCutoverStatus::Fresh,
+                zcash_pool_migration::delivery::DestinationSpendability::NotSpendable,
+            );
+        assert_eq!(
+            recovery_runtime.availability(),
+            zcash_pool_migration::delivery::MigrationRuntimeAvailability::Unavailable(
+                zcash_pool_migration::delivery::RuntimeUnavailableReason::FinalityRecovery(
+                    zcash_pool_migration::delivery::StorageRecoveryReason::CorruptFinalityEvidence,
+                )
+            )
+        );
+        assert!(matches!(
+            immediate_delivery_write(&conn, |transaction| {
+                store::reacquire_failed_immediate_materialization(
+                    transaction,
+                    &TABLES,
+                    crate::AccountRef(account_id),
+                    context,
+                    submission_revision,
+                    run_identity,
+                    artifact_identity,
+                    SignerOwnership::Sdk,
+                    Zatoshis::from_u64(TEST_GROSS_AMOUNT + 1).unwrap(),
+                    lease_duration,
+                    policy.fingerprint(),
+                )
+            }),
+            Err(Error::DeliveryRecoveryRequired)
+        ));
+        conn.execute_batch(
+            "ROLLBACK TO recovery_required_precedence; RELEASE recovery_required_precedence",
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery SET revision = ?
+             WHERE run_identity = ?",
+            rusqlite::params![MAX_PERSISTED_DELIVERY_REVISION, run_identity.as_bytes()],
+        )
+        .unwrap();
+        let exhausted_revision =
+            DeliveryRevision::read(MAX_PERSISTED_DELIVERY_REVISION.to_le_bytes().as_slice())
+                .unwrap();
+        let before_exhausted_retry: RetryMutableState = conn
+            .query_row(
+                "SELECT revision, status, claim_kind, attempt_token
+                   FROM zend_orchard_ironwood_immediate_delivery WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let outer_transaction = conn.transaction().unwrap();
+        let exhausted_retry = {
+            let mut wallet = crate::WalletDb::from_connection(
+                crate::SqlTransaction(&outer_transaction),
+                params,
+                crate::util::SystemClock,
+                OsRng,
+            );
+            ImmediateMigrationDeliveryStore::reacquire_failed_immediate_materialization(
+                &mut wallet,
+                &account,
+                exhausted_revision,
+                run_identity,
+                artifact_identity,
+                SignerOwnership::Sdk,
+                Zatoshis::from_u64(TEST_GROSS_AMOUNT).unwrap(),
+                lease_duration,
+                policy.fingerprint(),
+            )
+        };
+        assert!(matches!(
+            exhausted_retry,
+            Err(Error::DeliveryRevisionMismatch)
+        ));
+        outer_transaction
+            .commit()
+            .expect("the caller may safely commit unrelated outer work after the inner failure");
+        let after_exhausted_retry: RetryMutableState = conn
+            .query_row(
+                "SELECT revision, status, claim_kind, attempt_token
+                   FROM zend_orchard_ironwood_immediate_delivery WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            after_exhausted_retry, before_exhausted_retry,
+            "revision-bump failure must roll back the preceding claim update"
+        );
+        let authorizations_after_exhausted_retry: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_gross_authorization",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            authorizations_after_exhausted_retry, 0,
+            "revision-bump failure must also roll back newly persisted spend authorization"
+        );
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery SET revision = ?
+             WHERE run_identity = ?",
+            rusqlite::params![DeliveryRevision::INITIAL.as_u64(), run_identity.as_bytes()],
+        )
+        .unwrap();
+
+        let retry_at_exact_gross_limit = ImmediateDeliveryWriteTransaction::begin(&conn).unwrap();
+        let at_limit = store::reacquire_failed_immediate_materialization(
+            &retry_at_exact_gross_limit,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            DeliveryRevision::INITIAL,
+            run_identity,
+            artifact_identity,
+            SignerOwnership::Sdk,
+            Zatoshis::from_u64(TEST_GROSS_AMOUNT).unwrap(),
+            lease_duration,
+            policy.fingerprint(),
+        )
+        .expect("a proposal exactly at the current gross ceiling is retryable");
+        assert_eq!(at_limit.claims()[0].status(), ClaimStatus::Materializing);
+        drop(retry_at_exact_gross_limit);
+        let authorizations_after_savepoint_rollback: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_gross_authorization",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(authorizations_after_savepoint_rollback, 0);
+
+        let reacquired = immediate_delivery_write(&conn, |transaction| {
+            store::reacquire_failed_immediate_materialization(
+                transaction,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+                DeliveryRevision::INITIAL,
+                run_identity,
+                artifact_identity,
+                SignerOwnership::Sdk,
+                Zatoshis::from_u64(TEST_GROSS_AMOUNT + 1).unwrap(),
+                lease_duration,
+                policy.fingerprint(),
+            )
+        })
+        .expect("a proposal below the current gross ceiling is retryable");
+        let claim = reacquired.claims().first().expect("one immediate claim");
+        assert_eq!(reacquired.run_identity(), run_identity);
+        assert_eq!(
+            claim.artifact_identity(),
+            DeliveryArtifactIdentity::Immediate(artifact_identity)
+        );
+        assert_eq!(claim.signer_ownership(), SignerOwnership::Sdk);
+        assert_eq!(claim.status(), ClaimStatus::Materializing);
+        assert_eq!(claim.claim_kind(), Some(ClaimKind::Materialization));
+        assert!(claim.token().is_some());
+        assert!(!claim.has_exposure_history());
+        assert!(claim.external_signing_pczt().is_none());
+        assert!(claim.signed_pczt().is_none());
+        assert!(claim.exact_transaction().is_none());
+        assert!(claim.txid().is_none());
+        assert_eq!(claim.last_error(), None);
+        assert_eq!(
+            reacquired.revision(),
+            DeliveryRevision::INITIAL.checked_next().unwrap()
+        );
+        assert_eq!(
+            reacquired.immediate_maximum_gross_amount(),
+            Some(Zatoshis::from_u64(TEST_GROSS_AMOUNT + 1).unwrap())
+        );
+        conn.execute_batch("SAVEPOINT stage_after_v1_upgrade")
+            .unwrap();
+        let staged_after_upgrade = store::stage_immediate_transaction(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            reacquired.revision(),
+            run_identity,
+            claim.token().unwrap(),
+            &exact,
+            policy.fingerprint(),
+            &staging_seal,
+        )
+        .expect("v2 active exact-evidence schema accepts a staged transaction after upgrade");
+        assert_eq!(
+            staged_after_upgrade.claims()[0].status(),
+            ClaimStatus::Staged
+        );
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET destination_output_index = NULL, expected_ironwood_amount = NULL
+              WHERE run_identity = ?",
+            rusqlite::params![run_identity.as_bytes()],
+        )
+        .unwrap();
+        let (quarantined_current, _) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .expect("legacy exact evidence without its destination tuple is quarantined");
+        assert!(matches!(
+            quarantined_current.unwrap().0.storage_finality(),
+            zcash_pool_migration::delivery::StorageFinality::RecoveryRequired(
+                zcash_pool_migration::delivery::StorageRecoveryReason::CorruptFinalityEvidence
+            )
+        ));
+        type RecoveryMutableState = (
+            u64,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<u64>,
+        );
+        let recovery_state_after_first_load: RecoveryMutableState = conn
+            .query_row(
+                "SELECT immediate.revision, immediate.storage_finality,
+                        immediate.storage_recovery_reason, immediate.status, runs.status,
+                        reservations.status, immediate.attempt_token,
+                        immediate.observed_mined_height
+                   FROM zend_orchard_ironwood_immediate_delivery immediate
+                   JOIN zend_orchard_ironwood_delivery_runs runs
+                     ON runs.run_identity = immediate.run_identity
+                   JOIN zend_orchard_ironwood_delivery_reservations reservations
+                     ON reservations.run_identity = immediate.run_identity
+                  WHERE immediate.run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let (quarantined_again, _) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .expect("recovery authority is absorbing on repeated load");
+        assert!(matches!(
+            quarantined_again.unwrap().0.storage_finality(),
+            zcash_pool_migration::delivery::StorageFinality::RecoveryRequired(
+                zcash_pool_migration::delivery::StorageRecoveryReason::CorruptFinalityEvidence
+            )
+        ));
+        let recovery_state_after_second_load: RecoveryMutableState = conn
+            .query_row(
+                "SELECT immediate.revision, immediate.storage_finality,
+                        immediate.storage_recovery_reason, immediate.status, runs.status,
+                        reservations.status, immediate.attempt_token,
+                        immediate.observed_mined_height
+                   FROM zend_orchard_ironwood_immediate_delivery immediate
+                   JOIN zend_orchard_ironwood_delivery_runs runs
+                     ON runs.run_identity = immediate.run_identity
+                   JOIN zend_orchard_ironwood_delivery_reservations reservations
+                     ON reservations.run_identity = immediate.run_identity
+                  WHERE immediate.run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            recovery_state_after_second_load, recovery_state_after_first_load,
+            "recovery rows must not receive later lease, mining, expiry, or revision mutations",
+        );
+        conn.execute_batch("ROLLBACK TO stage_after_v1_upgrade; RELEASE stage_after_v1_upgrade")
+            .unwrap();
+
+        let resolved_unmined_release = u32::from(evidence.expiry_height()) + 100;
+        conn.execute_batch("SAVEPOINT external_signing_terminal_reload")
+            .unwrap();
+        conn.execute(
+            "UPDATE accounts SET birthday_height = 1 WHERE id = ?",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE scan_queue SET block_range_start = 0, block_range_end = ?, priority = 10",
+            rusqlite::params![resolved_unmined_release + 1],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE transactions SET block = 1, mined_height = 1 WHERE txid = ?",
+            rusqlite::params![source.txid().as_ref()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE orchard_received_notes SET nf = ?
+              WHERE transaction_id = (SELECT id_tx FROM transactions WHERE txid = ?)
+                AND action_index = ?",
+            rusqlite::params![[0xE1u8; 32], source.txid().as_ref(), source.output_index(),],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET phase = 'active', signer_ownership = 'external',
+                    status = 'awaiting_external_signature', claim_kind = NULL,
+                    attempt_token = NULL, lease_clock_session = NULL,
+                    lease_acquired_at_ms = NULL, lease_expires_at_ms = NULL,
+                    txid = NULL, exact_tx = NULL, exact_tx_digest = NULL,
+                    unsigned_pczt_digest = ?, canonical_unsigned_pczt = ?,
+                    signed_pczt_digest = NULL, canonical_signed_pczt = NULL,
+                    signed_pczt_binding = NULL, last_error = NULL,
+                    storage_finality = 'active', storage_recovery_reason = NULL,
+                    observed_mined_height = NULL, destination_output_index = NULL,
+                    expected_ironwood_amount = NULL, release_at_height = NULL,
+                    finalized_tip_height = NULL
+              WHERE run_identity = ?",
+            rusqlite::params![
+                unsigned_pczt.digest().as_bytes(),
+                unsigned_pczt.bytes(),
+                run_identity.as_bytes(),
+            ],
+        )
+        .unwrap();
+        let (expired_current, _) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .unwrap();
+        let expired_external = expired_current.unwrap().0;
+        assert_eq!(
+            expired_external.claims()[0].status(),
+            ClaimStatus::ExternalSigningExpiredUnmined
+        );
+        let abandoning_external = store::begin_immediate_abandonment(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            expired_external.revision(),
+            run_identity,
+        )
+        .unwrap();
+        store::finish_immediate_abandonment(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            abandoning_external.revision(),
+            run_identity,
+        )
+        .unwrap();
+        let (finalized_current, finalized_retained) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .unwrap();
+        assert!(finalized_current.is_none());
+        assert_eq!(finalized_retained.len(), 1);
+        assert!(matches!(
+            finalized_retained[0].delivery().storage_finality(),
+            zcash_pool_migration::delivery::StorageFinality::Finalized(_)
+        ));
+        conn.execute(
+            "UPDATE scan_queue SET block_range_end = ?",
+            rusqlite::params![resolved_unmined_release],
+        )
+        .unwrap();
+        let (rewound_current, _) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .unwrap();
+        assert!(matches!(
+            rewound_current.unwrap().0.storage_finality(),
+            zcash_pool_migration::delivery::StorageFinality::RecoveryRequired(
+                zcash_pool_migration::delivery::StorageRecoveryReason::RewoundBeyondFinalityHorizon
+            )
+        ));
+        conn.execute_batch(
+            "ROLLBACK TO external_signing_terminal_reload;
+             RELEASE external_signing_terminal_reload",
+        )
+        .unwrap();
+
+        conn.execute_batch("SAVEPOINT external_staged_terminal_reload")
+            .unwrap();
+        conn.execute(
+            "UPDATE accounts SET birthday_height = 1 WHERE id = ?",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE scan_queue SET block_range_start = 0, block_range_end = ?, priority = 10",
+            rusqlite::params![resolved_unmined_release + 1],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE transactions SET block = 1, mined_height = 1 WHERE txid = ?",
+            rusqlite::params![source.txid().as_ref()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE orchard_received_notes SET nf = ?
+              WHERE transaction_id = (SELECT id_tx FROM transactions WHERE txid = ?)
+                AND action_index = ?",
+            rusqlite::params![[0xE2u8; 32], source.txid().as_ref(), source.output_index(),],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_delivery
+                SET phase = 'active', signer_ownership = 'external', status = 'staged',
+                    claim_kind = NULL, attempt_token = NULL, lease_clock_session = NULL,
+                    lease_acquired_at_ms = NULL, lease_expires_at_ms = NULL,
+                    txid = ?, exact_tx = ?, exact_tx_digest = ?,
+                    unsigned_pczt_digest = ?, canonical_unsigned_pczt = ?,
+                    signed_pczt_digest = ?, canonical_signed_pczt = ?,
+                    signed_pczt_binding = ?, last_error = NULL,
+                    storage_finality = 'active', storage_recovery_reason = NULL,
+                    observed_mined_height = NULL, destination_output_index = 0,
+                    expected_ironwood_amount = 0, release_at_height = NULL,
+                    finalized_tip_height = NULL
+              WHERE run_identity = ?",
+            rusqlite::params![
+                exact.txid().as_ref(),
+                exact.bytes(),
+                exact.digest().as_bytes(),
+                unsigned_pczt.digest().as_bytes(),
+                unsigned_pczt.bytes(),
+                signed_pczt.signed_digest().as_bytes(),
+                signed_pczt.bytes(),
+                signed_pczt.staged_digest().as_bytes(),
+                run_identity.as_bytes(),
+            ],
+        )
+        .unwrap();
+        let (staged_expired_current, _) = store::load_immediate_delivery_runtime_parts(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+        )
+        .unwrap();
+        let staged_expired = staged_expired_current.unwrap().0;
+        assert_eq!(
+            staged_expired.claims()[0].status(),
+            ClaimStatus::ExpiredUnmined
+        );
+        let staged_abandoning = store::begin_immediate_abandonment(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            staged_expired.revision(),
+            run_identity,
+        )
+        .unwrap();
+        store::finish_immediate_abandonment(
+            &conn,
+            &TABLES,
+            crate::AccountRef(account_id),
+            context,
+            staged_abandoning.revision(),
+            run_identity,
+        )
+        .unwrap();
+        let (staged_finalized_current, staged_finalized_retained) =
+            store::load_immediate_delivery_runtime_parts(
+                &conn,
+                &TABLES,
+                crate::AccountRef(account_id),
+                context,
+            )
+            .unwrap();
+        assert!(staged_finalized_current.is_none());
+        assert_eq!(staged_finalized_retained.len(), 1);
+        assert!(matches!(
+            staged_finalized_retained[0].delivery().storage_finality(),
+            zcash_pool_migration::delivery::StorageFinality::Finalized(_)
+        ));
+        conn.execute_batch(
+            "ROLLBACK TO external_staged_terminal_reload;
+             RELEASE external_staged_terminal_reload",
+        )
+        .unwrap();
+        let stored_authorization: (u32, u64) = conn
+            .query_row(
+                "SELECT authorization_version, maximum_gross_amount
+                   FROM zend_orchard_ironwood_immediate_gross_authorization
+                  WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_authorization, (1, TEST_GROSS_AMOUNT + 1));
+        assert_eq!(
+            output_lock(&conn, &source),
+            lock_before_upgrade,
+            "v1 reauthorization must preserve the exact wallet lock"
+        );
+        let stable_after: StableImmediateAuthority = conn
+            .query_row(
+                "SELECT artifact_identity, proposal_fingerprint, canonical_proposal,
+                        signer_ownership, policy, policy_fingerprint
+                   FROM zend_orchard_ironwood_immediate_delivery WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stable_after, stable_before);
+        assert!(
+            immediate_delivery_write(&conn, |transaction| {
+                store::reacquire_failed_immediate_materialization(
+                    transaction,
+                    &TABLES,
+                    crate::AccountRef(account_id),
+                    context,
+                    DeliveryRevision::INITIAL,
+                    run_identity,
+                    artifact_identity,
+                    SignerOwnership::Sdk,
+                    Zatoshis::from_u64(TEST_GROSS_AMOUNT + 1).unwrap(),
+                    lease_duration,
+                    policy.fingerprint(),
+                )
+            })
+            .is_err(),
+            "a stale handle cannot mint a second claim",
+        );
+        assert!(matches!(
+            store::delivery_schema_provenance(&conn, &TABLES).unwrap(),
+            zcash_pool_migration::delivery::DeliverySchemaProvenance::Compatible(_)
+        ));
+        conn.execute(
+            "UPDATE zend_orchard_ironwood_immediate_gross_authorization
+                SET maximum_gross_amount = ? WHERE run_identity = ?",
+            rusqlite::params![TEST_GROSS_AMOUNT - 1, run_identity.as_bytes()],
+        )
+        .unwrap();
+        assert_eq!(
+            store::delivery_schema_provenance(&conn, &TABLES).unwrap(),
+            zcash_pool_migration::delivery::DeliverySchemaProvenance::Corrupt,
+            "provenance must reject a persisted ceiling below the canonical proposal gross",
+        );
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    #[test]
+    fn immediate_gross_limit_rejects_before_any_authority_or_lock_write() {
+        use prost::Message;
+        use rand::rngs::OsRng;
+        use zcash_client_backend::{
+            proto::proposal::{self, proposed_input},
+            wallet::LockOwner,
+        };
+        use zcash_pool_migration::delivery::{
+            ClaimKind, ClaimToken, DeliveryLease, ImmediateArtifactEvidence,
+            ImmediateArtifactIdentity, ImmediateProposal, ImmediateProposalPayload,
+            LeaseClockSession, LeaseDuration, LoopbackDevelopmentEndpoint, MigrationRunIdentity,
+            MonotonicLeaseInstant, SignerOwnership, SourceReservationOwner, SubmissionContext,
+            SubmissionPolicy, SubmissionPolicyRequest, SubmissionTransport,
+        };
+        use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
+        use zcash_protocol::{
+            PoolType, ShieldedPool,
+            consensus::{BlockHeight, BranchId},
+            value::Zatoshis,
+        };
+
+        /// Gross Orchard input represented by the canonical one-step proposal.
+        const TEST_GROSS_AMOUNT: u64 = 50_000;
+        /// Stable test target at which the regtest network has an active branch.
+        const TEST_TARGET_HEIGHT: u32 = 120;
+        /// Bounded materialization lease used only to prove no capability row is written.
+        const TEST_LEASE_MILLIS: u64 = 5_000;
+        /// Start of the synthetic test clock session.
+        const TEST_LEASE_START_MILLIS: u64 = 0;
+        /// Distinct test-only identifier byte for the lockable source transaction.
+        const TEST_SOURCE_TXID_BYTE: u8 = 0x54;
+        /// Distinct test-only identifier byte for the canonical migration lock owner.
+        const TEST_LOCK_OWNER_BYTE: u8 = 0x55;
+        /// Byte width of a canonical lock-owner identifier.
+        const TEST_LOCK_OWNER_LENGTH: usize = 32;
+
+        let conn = fresh_conn();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_delivery_control_tables(&conn).expect("delivery schema");
+        let account = insert_account(&conn);
+        let account_id: i64 = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE uuid = ?",
+                rusqlite::params![account.expose_uuid()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let source = insert_lockable_output(&conn, account, TEST_SOURCE_TXID_BYTE);
+        let payload = proposal::Proposal {
+            steps: vec![proposal::ProposalStep {
+                inputs: vec![proposal::ProposedInput {
+                    value: Some(proposed_input::Value::ReceivedOutput(
+                        proposal::ReceivedOutput {
+                            txid: source.txid().as_ref().to_vec(),
+                            value_pool: proposal::ValuePool::Orchard.into(),
+                            index: source.output_index(),
+                            value: TEST_GROSS_AMOUNT,
+                        },
+                    )),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let params = zcash_pool_migration_memory::regtest_network(true);
+        let context = SubmissionContext::from_parameters(&params);
+        let target_height = BlockHeight::from_u32(TEST_TARGET_HEIGHT);
+        let proposal = ImmediateProposal::new(
+            target_height,
+            BlockHeight::from_u32(TEST_TARGET_HEIGHT + DEFAULT_TX_EXPIRY_DELTA),
+            BranchId::for_height(&params, target_height),
+            ImmediateProposalPayload::try_from(payload).unwrap(),
+        )
+        .expect("one-step Orchard proposal envelope");
+        let artifact_identity = ImmediateArtifactIdentity::random(&mut OsRng);
+        let evidence = ImmediateArtifactEvidence::from_proposal(artifact_identity, &proposal);
+        let run_identity = MigrationRunIdentity::random(&mut OsRng);
+        let source_owner = SourceReservationOwner::random(&mut OsRng);
+        let lock_owner = LockOwner::new([TEST_LOCK_OWNER_BYTE; TEST_LOCK_OWNER_LENGTH]);
+        let transport = SubmissionTransport::LoopbackDevelopment(
+            LoopbackDevelopmentEndpoint::try_from("http://127.0.0.1:9067".to_owned()).unwrap(),
+        );
+        let policy =
+            SubmissionPolicy::validate(SubmissionPolicyRequest::new(context, transport), context)
+                .expect("test policy");
+        let lease = DeliveryLease::new(
+            ClaimKind::Materialization,
+            ClaimToken::random(&mut OsRng),
+            MonotonicLeaseInstant::new(
+                LeaseClockSession::random(&mut OsRng),
+                TEST_LEASE_START_MILLIS,
+            ),
+            LeaseDuration::from_millis(TEST_LEASE_MILLIS).unwrap(),
+        )
+        .unwrap();
+        let maximum_gross_amount = Zatoshis::from_u64(TEST_GROSS_AMOUNT - 1).unwrap();
+
+        let error = immediate_delivery_write(&conn, |transaction| {
+            store::reserve_immediate_delivery(
+                transaction,
+                &TABLES,
+                crate::AccountRef(account_id),
+                &proposal,
+                &evidence,
+                &[source],
+                run_identity,
+                source_owner,
+                lock_owner,
+                SignerOwnership::Sdk,
+                lease,
+                &policy,
+                context,
+                maximum_gross_amount,
+            )
+        })
+        .expect_err("proposal above the user's gross ceiling must fail");
+        assert!(matches!(error, Error::ImmediateAmountLimitExceeded));
+        for table in [
+            "zend_orchard_ironwood_delivery_runs",
+            "zend_orchard_ironwood_immediate_delivery",
+            "zend_orchard_ironwood_immediate_gross_authorization",
+            "zend_orchard_ironwood_delivery_reservations",
+        ] {
+            let rows: u64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table} retained rejected authority");
+        }
+        assert_eq!(
+            output_lock(&conn, &source),
+            (None, None),
+            "gross-limit rejection must not lock the Orchard source"
+        );
+        assert_eq!(source.pool(), PoolType::Shielded(ShieldedPool::Orchard));
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    #[test]
+    fn public_immediate_reservation_rolls_back_auth_on_late_reservation_failure() {
+        use zcash_client_backend::data_api::Account as _;
+        use zcash_client_backend::data_api::testing::{
+            AddressType, TestBuilder, orchard::OrchardPoolTester, pool::ShieldedPoolTester,
+        };
+        use zcash_pool_migration::delivery::{
+            ImmediateMigrationDeliveryStore, ImmediateMigrationIntent, LeaseDuration,
+            LoopbackDevelopmentEndpoint, SignerOwnership, SubmissionContext, SubmissionPolicy,
+            SubmissionPolicyRequest, SubmissionTransport,
+        };
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::{
+            consensus::BlockHeight, local_consensus::LocalNetwork, value::Zatoshis,
+        };
+
+        use crate::testing::{BlockCache, db::TestDbFactory};
+
+        let activation = BlockHeight::from_u32(100_000);
+        let ironwood_active_network = LocalNetwork {
+            nu6: Some(activation),
+            nu6_1: Some(activation),
+            nu6_2: Some(activation),
+            nu6_3: Some(activation),
+            ..TestBuilder::<(), ()>::DEFAULT_NETWORK
+        };
+        let mut state = TestBuilder::new()
+            .with_network(ironwood_active_network)
+            .with_block_cache(BlockCache::new())
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+        let fvk = OrchardPoolTester::test_account_fvk(&state);
+        let value = Zatoshis::const_from_u64(1_000_000);
+        let (height, _, _) = state.generate_next_block(&fvk, AddressType::DefaultExternal, value);
+        state.scan_cached_blocks(height, 1);
+        for _ in 0..9 {
+            let (height, _) = state.generate_empty_block();
+            state.scan_cached_blocks(height, 1);
+        }
+        let account = state.test_account().unwrap().id();
+        let context = SubmissionContext::from_parameters(state.network());
+        let policy = SubmissionPolicy::validate(
+            SubmissionPolicyRequest::new(
+                context,
+                SubmissionTransport::LoopbackDevelopment(
+                    LoopbackDevelopmentEndpoint::try_from("http://127.0.0.1:9067".to_owned())
+                        .unwrap(),
+                ),
+            ),
+            context,
+        )
+        .unwrap();
+        let lock_before: (Option<u32>, Option<Vec<u8>>) = state
+            .wallet()
+            .conn()
+            .query_row(
+                "SELECT lock_expiry_height, lock_owner FROM orchard_received_notes LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        state
+            .wallet()
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_immediate_reservation_insert
+                 BEFORE INSERT ON zend_orchard_ironwood_delivery_reservations
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected late reservation failure');
+                 END;",
+            )
+            .unwrap();
+
+        let result = ImmediateMigrationDeliveryStore::reserve_immediate_delivery(
+            state.wallet_mut().db_mut(),
+            ImmediateMigrationIntent::new(account, SignerOwnership::Sdk, value),
+            &policy,
+            LeaseDuration::from_millis(5_000).unwrap(),
+        );
+        let error = match result {
+            Ok(_) => panic!("the injected late reservation failure must abort the reservation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("injected late reservation failure"),
+            "the test must reach the injected post-authorization reservation failure: {error}",
+        );
+        for table in [
+            "zend_orchard_ironwood_delivery_runs",
+            "zend_orchard_ironwood_immediate_delivery",
+            "zend_orchard_ironwood_immediate_gross_authorization",
+            "zend_orchard_ironwood_delivery_reservations",
+        ] {
+            let rows: u64 = state
+                .wallet()
+                .conn()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table} leaked a partial reservation write");
+        }
+        let lock_after: (Option<u32>, Option<Vec<u8>>) = state
+            .wallet()
+            .conn()
+            .query_row(
+                "SELECT lock_expiry_height, lock_owner FROM orchard_received_notes LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lock_after, lock_before);
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    #[test]
+    fn public_immediate_reservation_commits_auth_and_reloads_available() {
+        use zcash_client_backend::data_api::Account as _;
+        use zcash_client_backend::data_api::testing::{
+            AddressType, TestBuilder, orchard::OrchardPoolTester, pool::ShieldedPoolTester,
+        };
+        use zcash_pool_migration::delivery::{
+            ImmediateMigrationDeliveryStore, ImmediateMigrationIntent, LeaseDuration,
+            LoopbackDevelopmentEndpoint, MigrationRuntimeAvailability, ReservedImmediateArtifact,
+            SignerOwnership, SubmissionContext, SubmissionPolicy, SubmissionPolicyRequest,
+            SubmissionTransport,
+        };
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::{
+            consensus::BlockHeight, local_consensus::LocalNetwork, value::Zatoshis,
+        };
+
+        use crate::testing::{BlockCache, db::TestDbFactory};
+
+        let activation = BlockHeight::from_u32(100_000);
+        let ironwood_active_network = LocalNetwork {
+            nu6: Some(activation),
+            nu6_1: Some(activation),
+            nu6_2: Some(activation),
+            nu6_3: Some(activation),
+            ..TestBuilder::<(), ()>::DEFAULT_NETWORK
+        };
+        let mut state = TestBuilder::new()
+            .with_network(ironwood_active_network)
+            .with_block_cache(BlockCache::new())
+            .with_data_store_factory(TestDbFactory::default())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+        let fvk = OrchardPoolTester::test_account_fvk(&state);
+        let maximum_gross_amount = Zatoshis::const_from_u64(1_000_000);
+        let (height, _, _) =
+            state.generate_next_block(&fvk, AddressType::DefaultExternal, maximum_gross_amount);
+        state.scan_cached_blocks(height, 1);
+        for _ in 0..9 {
+            let (height, _) = state.generate_empty_block();
+            state.scan_cached_blocks(height, 1);
+        }
+        let account = state.test_account().unwrap().id();
+        let context = SubmissionContext::from_parameters(state.network());
+        let policy = SubmissionPolicy::validate(
+            SubmissionPolicyRequest::new(
+                context,
+                SubmissionTransport::LoopbackDevelopment(
+                    LoopbackDevelopmentEndpoint::try_from("http://127.0.0.1:9067".to_owned())
+                        .unwrap(),
+                ),
+            ),
+            context,
+        )
+        .unwrap();
+
+        let reserved = ImmediateMigrationDeliveryStore::reserve_immediate_delivery(
+            state.wallet_mut().db_mut(),
+            ImmediateMigrationIntent::new(account, SignerOwnership::Sdk, maximum_gross_amount),
+            &policy,
+            LeaseDuration::from_millis(5_000).unwrap(),
+        )
+        .expect("fresh immediate reservation commits");
+        assert_eq!(
+            reserved.snapshot().immediate_maximum_gross_amount(),
+            Some(maximum_gross_amount)
+        );
+        let run_identity = reserved.snapshot().run_identity();
+        drop(reserved);
+
+        let stored_authorization: (u32, u64) = state
+            .wallet()
+            .conn()
+            .query_row(
+                "SELECT authorization_version, maximum_gross_amount
+                   FROM zend_orchard_ironwood_immediate_gross_authorization
+                  WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_authorization, (1, maximum_gross_amount.into_u64()));
+        let runtime = ImmediateMigrationDeliveryStore::immediate_runtime_snapshot(
+            state.wallet_mut().db_mut(),
+            &account,
+        )
+        .expect("committed immediate runtime reloads");
+        assert_eq!(
+            runtime.availability(),
+            MigrationRuntimeAvailability::Available
+        );
+        assert_eq!(
+            runtime.delivery().unwrap().immediate_maximum_gross_amount(),
+            Some(maximum_gross_amount)
+        );
     }
 
     #[cfg(feature = "migration-delivery")]
@@ -1478,13 +3327,13 @@ mod tests {
         let future_account = insert_account(&future);
         future
             .execute(
-                "UPDATE zend_orchard_ironwood_delivery_meta SET schema_version = 2",
+                "UPDATE zend_orchard_ironwood_delivery_meta SET schema_version = 3",
                 [],
             )
             .unwrap();
         assert_eq!(
             provenance(&mut future, future_account),
-            DeliverySchemaProvenance::Future(DeliverySchemaVersion::from_u32(2).unwrap())
+            DeliverySchemaProvenance::Future(DeliverySchemaVersion::from_u32(3).unwrap())
         );
 
         let mut fk = fresh_conn();
@@ -1526,6 +3375,301 @@ mod tests {
             DeliverySchemaProvenance::Corrupt,
             "delivery DDL without every note-locking column is not a compatible runtime schema",
         );
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    #[test]
+    fn gross_authorization_upgrade_failure_rolls_back_table_and_provenance() {
+        let mut conn = fresh_conn();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_delivery_control_v1_tables(&conn).unwrap();
+        let canonical_objects = |conn: &Connection| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT type, name, sql FROM sqlite_schema
+                      WHERE name IN (
+                          'zend_orchard_ironwood_immediate_delivery',
+                          'idx_zend_orchard_ironwood_immediate_lease',
+                          'zend_orchard_ironwood_delivery_run_delete_guard',
+                          'zend_orchard_ironwood_delivery_account_delete_guard'
+                      )
+                      ORDER BY type, name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let schema_before = canonical_objects(&conn);
+        assert_eq!(schema_before.len(), 4);
+        let immediate_rows_before: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_delivery",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_gross_authorization_provenance_update
+             BEFORE UPDATE OF schema_version ON zend_orchard_ironwood_delivery_meta
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected provenance CAS failure');
+             END;",
+        )
+        .unwrap();
+
+        let transaction = conn.transaction().unwrap();
+        let error = upgrade_immediate_gross_authorization(&transaction).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected provenance CAS failure"),
+            "the failure must be injected after the table copy, not an earlier v1-shape rejection: {error}"
+        );
+        transaction.rollback().unwrap();
+
+        let provenance: (u32, String) = conn
+            .query_row(
+                "SELECT schema_version, implementation
+                   FROM zend_orchard_ironwood_delivery_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance,
+            (1, "just-zend/librustzcash-delivery-v1".to_owned())
+        );
+        assert_eq!(canonical_objects(&conn), schema_before);
+        let immediate_rows_after: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM zend_orchard_ironwood_immediate_delivery",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(immediate_rows_after, immediate_rows_before);
+        let authorization_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                      WHERE name = 'zend_orchard_ironwood_immediate_gross_authorization'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!authorization_table_exists);
+        let backup_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                      WHERE name = 'zend_orchard_ironwood_immediate_delivery_v1_upgrade'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!backup_table_exists);
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    #[test]
+    fn gross_authorization_upgrade_rejects_malformed_exact_v1_without_repair() {
+        let mut conn = fresh_conn();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        init_delivery_control_v1_tables(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_zend_orchard_ironwood_immediate_lease")
+            .unwrap();
+
+        let transaction = conn.transaction().unwrap();
+        assert!(matches!(
+            upgrade_immediate_gross_authorization(&transaction),
+            Err(Error::Corrupt("delivery v1 schema shape"))
+        ));
+        transaction.rollback().unwrap();
+
+        let provenance: (u32, String) = conn
+            .query_row(
+                "SELECT schema_version, implementation
+                   FROM zend_orchard_ironwood_delivery_meta WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance,
+            (1, "just-zend/librustzcash-delivery-v1".to_owned())
+        );
+        let authorization_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                      WHERE name = 'zend_orchard_ironwood_immediate_gross_authorization'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!authorization_table_exists);
+    }
+
+    #[cfg(feature = "migration-delivery")]
+    #[test]
+    fn gross_authorization_upgrade_preserves_live_scheduled_lane() {
+        use zcash_client_backend::wallet::LockOwner;
+        use zcash_pool_migration::delivery::{
+            LoopbackDevelopmentEndpoint, MigrationRunIdentity, MigrationRuntimeAvailability,
+            SourceReservationOwner, SubmissionContext, SubmissionPolicy, SubmissionPolicyRequest,
+            SubmissionTransport, migration_state_fingerprint,
+        };
+        use zcash_protocol::consensus::BlockHeight;
+
+        let mut conn = fresh_conn();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let account = insert_account(&conn);
+        let owner = LockOwner::new([0xD1; 32]);
+        let (expected_state, source) =
+            source_bound_transfer_state(&conn, account, owner, 0xD2, 0xD300);
+        PoolMigrations::for_account(&mut conn, account)
+            .unwrap()
+            .replace_migration(&expected_state)
+            .unwrap();
+        conn.execute(
+            "UPDATE orchard_received_notes
+                SET lock_expiry_height = ?, lock_owner = ?
+              WHERE transaction_id = (SELECT id_tx FROM transactions WHERE txid = ?)
+                AND action_index = ?",
+            rusqlite::params![
+                u32::from(BlockHeight::from_u32(u32::MAX)),
+                owner.as_bytes(),
+                source.txid().as_ref(),
+                source.output_index(),
+            ],
+        )
+        .unwrap();
+        init_delivery_control_v1_tables(&conn).unwrap();
+        let account_id: i64 = conn
+            .query_row(
+                "SELECT id FROM accounts WHERE uuid = ?",
+                rusqlite::params![account.expose_uuid()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migration_id: i64 = conn
+            .query_row(
+                "SELECT id FROM orchard_ironwood_migrations WHERE account_id = ?",
+                rusqlite::params![account_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let run_identity = MigrationRunIdentity::read([0xD3; 32].as_slice()).unwrap();
+        let source_owner = SourceReservationOwner::read([0xD4; 32].as_slice()).unwrap();
+        let params = zcash_pool_migration_memory::regtest_network(true);
+        let context = SubmissionContext::from_parameters(&params);
+        let policy = SubmissionPolicy::validate(
+            SubmissionPolicyRequest::new(
+                context,
+                SubmissionTransport::LoopbackDevelopment(
+                    LoopbackDevelopmentEndpoint::try_from("http://127.0.0.1:9067".to_owned())
+                        .unwrap(),
+                ),
+            ),
+            context,
+        )
+        .unwrap();
+        let authority = store::delivery_run_authority_fingerprint(
+            run_identity.as_bytes(),
+            account_id,
+            "canonical",
+            Some(migration_id),
+            source_owner.as_bytes(),
+            Some(owner.as_bytes()),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zend_orchard_ironwood_delivery_runs (
+                 run_identity, account_id, lane, canonical_migration_id, source_owner,
+                 canonical_lock_owner, authority_fingerprint, status
+             ) VALUES (?, ?, 'canonical', ?, ?, ?, ?, 'active')",
+            rusqlite::params![
+                run_identity.as_bytes(),
+                account_id,
+                migration_id,
+                source_owner.as_bytes(),
+                owner.as_bytes(),
+                authority,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zend_orchard_ironwood_delivery_control (
+                 migration_id, run_identity, revision, state_fingerprint, phase,
+                 policy, policy_fingerprint
+             ) VALUES (?, ?, 1, ?, 'active', ?, ?)",
+            rusqlite::params![
+                migration_id,
+                run_identity.as_bytes(),
+                migration_state_fingerprint(&expected_state).as_bytes(),
+                policy.canonical_bytes(),
+                policy.fingerprint().as_bytes(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO zend_orchard_ironwood_delivery_reservations (
+                 run_identity, source_txid, source_index, status
+             ) VALUES (?, ?, ?, 'active')",
+            rusqlite::params![
+                run_identity.as_bytes(),
+                source.txid().as_ref(),
+                source.output_index(),
+            ],
+        )
+        .unwrap();
+        let lock_before = output_lock(&conn, &source);
+        {
+            let transaction = conn.transaction().unwrap();
+            upgrade_immediate_gross_authorization(&transaction).unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let runtime = store::load_account_migration_runtime(&conn, &TABLES, account, context)
+            .unwrap()
+            .expect("scheduled account runtime");
+        assert_eq!(
+            runtime.runtime().availability(),
+            MigrationRuntimeAvailability::Available
+        );
+        assert_eq!(
+            runtime
+                .runtime()
+                .delivery()
+                .expect("live scheduled delivery")
+                .run_identity(),
+            run_identity,
+        );
+        let scheduled_authorizations: u64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM zend_orchard_ironwood_immediate_gross_authorization
+                  WHERE run_identity = ?",
+                rusqlite::params![run_identity.as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scheduled_authorizations, 0);
+        assert_eq!(output_lock(&conn, &source), lock_before);
+        let store = PoolMigrations::for_account(&conn, account).unwrap();
+        assert_eq!(store.get_migration().unwrap(), Some(expected_state));
     }
 
     #[cfg(feature = "migration-delivery")]

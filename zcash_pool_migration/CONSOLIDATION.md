@@ -1,7 +1,7 @@
 # Ironwood migration capability consolidation
 
 Status: working review note, 2026-07-23. The comparison baseline is
-`zcash/librustzcash` `main` at `8ae4581c03ed4122b81a7ad8d275d77a4d500f4b` and
+`zcash/librustzcash` `main` at `31b0607d6f7eaeead5485c76a8d03c73aad62ec5` and
 `just-zend/ZODLIronwoodMigrationRust` `origin/main` at
 `3fb1fdfdfc8185448dbbe7556f38d6c76b4d68e7`. This note records capability
 decisions; the Rust and downstream SDK pull requests remain the review authority.
@@ -64,6 +64,10 @@ persistence in `zcash_client_sqlite` and a minimal Zend delta maintained on top 
   early-carried here: the Zend delta stays on upstream `main` and should take the
   mechanical module/trait migration if and when that PR lands, without retaining a
   parallel locking abstraction.
+- Approved upstream PR [#2751](https://github.com/zcash/librustzcash/pull/2751) is a release-only
+  version/metadata update for `zcash_primitives`, `zcash_proofs`, and `pczt`. Its head is fully
+  green but remains unmerged, so it is tracked rather than early-carried; no migration capability
+  or schema differs from this branch because of it.
 
 ## Zend improvements retained on top
 
@@ -109,9 +113,29 @@ delivery-control layer rather than forking those implementations:
 - Immediate migration is a separate lane but uses the same run, source-reservation, artifact,
   policy, submission, and finality vocabulary. The store first derives and reserves an
   account-scoped intent from wallet state under a Rust-generated owner; only then may it expose a
-  typed proposal or PCZT. Callers cannot inject arbitrary sources, amounts, dependencies, or
+  typed proposal or PCZT. The only caller-supplied amount is a maximum gross authorization; the
+  SQLite store re-derives the exact selected Orchard input total from the canonical proposal and
+  rejects an over-limit proposal before any run, reservation, lock, or claim write in that same
+  wallet transaction. Callers cannot inject arbitrary sources, exact amounts, dependencies, or
   expiry. Unsigned and signed PCZT bytes are durable and never overwrite each other, including
   across an external-signature relaunch.
+- The user's maximum gross authorization is a versioned companion record committed in the same
+  SQLite transaction as the immediate run and source locks. The published v1 wallet migration is
+  frozen to its original schema fingerprint; its v2 successor rebuilds the immediate table under
+  corrected lifecycle constraints and never fabricates authorization for legacy rows. A legacy row
+  at a forward-exposure boundary is unavailable as `MissingSpendAuthorization`; exposed, outcome,
+  and terminal states retain their non-exposing reconciliation paths. An exact unexposed
+  `materialization_failed` state may be explicitly reauthorized. The retry transaction atomically
+  inserts authorization and advances the claim/revision, or rolls back all three.
+- A known-unsent immediate materialization failure may reacquire only a fresh bounded claim for the
+  same account, run, artifact, signer, policy, proposal, and reservations. Rust requires an active
+  run with no lease, PCZT, exact transaction, txid, or exposure history; it never derives a second
+  proposal. Ambiguous or externally exposed artifacts remain fail-closed.
+- Submission policy distinguishes direct canonical public-DNS TLS, public-DNS TLS through an
+  isolated Tor proxy, canonical v3 onion service transport, and explicit loopback development
+  transport. Literal IP and legacy numeric-IP spellings fail closed rather than bypassing the
+  public-endpoint class. A public LWD host is never mislabeled as an onion service or silently
+  downgraded to direct transport when Tor was requested.
 - Source reservations remain an independent wallet-selection exclusion through network ambiguity
   and the fixed storage-finality horizon. A unique active-source index prevents the same Orchard
   output from backing two runs. Finalized exact destination evidence is archived before release so
@@ -181,7 +205,8 @@ Keep these as small, independently reviewable proposals rather than proposing th
 - the minimal transfer-amount accessor needed by typed SDK projections;
 - generic typed delivery identities, CAS/lease semantics, exact-artifact evidence, and
   submission-outcome recovery, without Zend-specific transport or UI policy;
-- account-scoped immediate reservation-before-proposal and ordinary-spend authorization;
+- account-scoped immediate reservation-before-proposal, atomic maximum-gross authorization,
+  exact known-unsent claim reacquisition, and ordinary-spend authorization;
 - wallet-backed output finality evidence and finalized deep-rewind recovery.
 
 Each proposal must first be rechecked against current `zcash/librustzcash` issues, pull requests,

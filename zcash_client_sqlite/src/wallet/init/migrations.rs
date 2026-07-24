@@ -66,6 +66,8 @@ mod wallet_summaries;
 mod witness_stabilized_notes;
 #[cfg(feature = "migration-delivery")]
 mod zend_ironwood_delivery_control;
+#[cfg(feature = "migration-delivery")]
+mod zend_ironwood_gross_authorization;
 
 use std::{rc::Rc, sync::Mutex};
 
@@ -265,6 +267,8 @@ pub(super) fn all_migrations<
         Box::new(note_locking::Migration),
         #[cfg(feature = "migration-delivery")]
         Box::new(zend_ironwood_delivery_control::Migration),
+        #[cfg(feature = "migration-delivery")]
+        Box::new(zend_ironwood_gross_authorization::Migration),
     ]
 }
 
@@ -412,7 +416,7 @@ pub const CURRENT_LEAF_MIGRATIONS: &[Uuid] = &[
     add_transparent_value_index::MIGRATION_ID,
     ironwood_pool_code_views::MIGRATION_ID,
     #[cfg(feature = "migration-delivery")]
-    zend_ironwood_delivery_control::MIGRATION_ID,
+    zend_ironwood_gross_authorization::MIGRATION_ID,
     #[cfg(not(feature = "migration-delivery"))]
     orchard_ironwood_migration_tables::MIGRATION_ID,
     tree_retained_checkpoints::MIGRATION_ID,

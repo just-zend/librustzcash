@@ -11,6 +11,12 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- A successor to the Zend delivery-control wallet migration upgrades the frozen v1 schema to v2,
+  rebuilds the immediate-delivery table under corrected lifecycle constraints, and adds a
+  versioned companion record for the user-confirmed maximum gross amount. Existing rows receive no
+  fabricated authorization: forward-exposure-capable pre-chain states fail closed, while
+  already-exposed and terminal states retain their non-exposing reconciliation paths. An exact
+  eligible known-unsent failure may be explicitly reauthorized.
 - `WalletDb::get_unspent_ironwood_notes_at_historical_height` returns all Ironwood
   notes that existed and were unspent at a given height.
 - `WalletDb::transactionally_with_extension` performs wallet operations and writes to
@@ -55,6 +61,12 @@ workspace.
   lock lasts, and `lock_owner` records the flow that acquired it.
 
 ### Fixed
+- Immediate reservation and legacy reauthorization now commit their run, lock, source
+  reservation, claim, revision, and gross-authorization writes through one non-forgeable SQLite
+  transaction boundary, including nested savepoint rollback. Recovery authority is absorbing on
+  reload, and finalized confirmed, expired-unmined, and external-signing terminal rows reconcile
+  against their distinct evidence requirements without being reinterpreted by later lease or
+  chain transitions.
 - The coinbase branch of the transparent account-balance tally now classifies
   locked value into `Balance::locked_value`: previously a mature coinbase UTXO
   locked by an in-flight shielding proposal was still reported as spendable,

@@ -51,6 +51,9 @@ pub enum Error {
     DeliveryRunMismatch,
     /// Another scheduled or immediate delivery run already owns live account authority.
     DeliveryLaneConflict,
+    /// The wallet-derived immediate proposal would spend more Orchard value than the user's
+    /// confirmed gross-amount authorization.
+    ImmediateAmountLimitExceeded,
     /// The delivery row changed since the caller's snapshot.
     DeliveryRevisionMismatch,
     /// A submission policy is required for the requested operation.
@@ -129,6 +132,9 @@ impl fmt::Display for Error {
             Error::DeliveryLaneConflict => {
                 f.write_str("another live migration delivery run already owns this account")
             }
+            Error::ImmediateAmountLimitExceeded => f.write_str(
+                "wallet-derived immediate migration exceeds the authorized gross amount",
+            ),
             Error::DeliveryRevisionMismatch => {
                 f.write_str("delivery revision changed before the atomic write")
             }
@@ -203,6 +209,7 @@ impl std::error::Error for Error {
             | Error::DeliveryRunUnavailable
             | Error::DeliveryRunMismatch
             | Error::DeliveryLaneConflict
+            | Error::ImmediateAmountLimitExceeded
             | Error::DeliveryRevisionMismatch
             | Error::DeliveryPolicyMissing
             | Error::DeliveryPolicyMismatch

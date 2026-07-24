@@ -78,8 +78,8 @@ use {
         ExactTransaction, ExternalSigningPczt, ImmediateArtifactEvidence,
         ImmediateArtifactIdentity, ImmediateMigrationDeliveryStore, ImmediateMigrationIntent,
         ImmediateProposal, ImmediateProposalPayload, LeaseDuration, MigrationRunIdentity,
-        PolicyFingerprint, ReservedImmediateArtifact, SignedPcztEvidence, SourceReservationOwner,
-        SubmissionContext, SubmissionOutcome, SubmissionPolicy,
+        PolicyFingerprint, ReservedImmediateArtifact, SignedPcztEvidence, SignerOwnership,
+        SourceReservationOwner, SubmissionContext, SubmissionOutcome, SubmissionPolicy,
     },
     zcash_primitives::transaction::{Transaction, builder::DEFAULT_TX_EXPIRY_DELTA},
     zcash_protocol::{
@@ -137,6 +137,103 @@ struct ValidatedImmediateTransaction {
     destination_output_index: u32,
     ironwood_amount: Zatoshis,
 }
+
+#[cfg(feature = "migration-delivery")]
+mod immediate_delivery_write {
+    /// A private write capability that exists only while an IMMEDIATE transaction or a nested
+    /// savepoint is active. Multi-write delivery helpers accept this type instead of `Connection`,
+    /// so they cannot accidentally be called in autocommit mode. Dropping it without `commit`
+    /// rolls back the complete write unit, including when the SDK materializer already owns the
+    /// outer wallet transaction.
+    pub(in crate::pool_migration) struct Transaction<'conn> {
+        boundary: Boundary<'conn>,
+    }
+
+    enum Boundary<'conn> {
+        Immediate(Option<rusqlite::Transaction<'conn>>),
+        Savepoint {
+            conn: &'conn rusqlite::Connection,
+            name: String,
+            active: bool,
+        },
+    }
+
+    impl<'conn> Transaction<'conn> {
+        pub(in crate::pool_migration) fn begin(
+            conn: &'conn rusqlite::Connection,
+        ) -> rusqlite::Result<Self> {
+            let boundary = if conn.is_autocommit() {
+                Boundary::Immediate(Some(rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?))
+            } else {
+                static NEXT_SAVEPOINT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let sequence = NEXT_SAVEPOINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let name = format!("zend_ironwood_immediate_delivery_write_{sequence}");
+                conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+                Boundary::Savepoint {
+                    conn,
+                    name,
+                    active: true,
+                }
+            };
+            Ok(Self { boundary })
+        }
+
+        pub(in crate::pool_migration) fn connection(&self) -> &rusqlite::Connection {
+            match &self.boundary {
+                Boundary::Immediate(transaction) => transaction
+                    .as_ref()
+                    .expect("an active delivery write transaction owns its SQLite transaction"),
+                Boundary::Savepoint { conn, .. } => conn,
+            }
+        }
+
+        pub(in crate::pool_migration) fn commit(mut self) -> rusqlite::Result<()> {
+            match &mut self.boundary {
+                Boundary::Immediate(transaction) => transaction
+                    .take()
+                    .expect("an active delivery write transaction owns its SQLite transaction")
+                    .commit(),
+                Boundary::Savepoint { conn, name, active } => {
+                    conn.execute_batch(&format!("RELEASE {name}"))?;
+                    *active = false;
+                    Ok(())
+                }
+            }
+        }
+
+        pub(in crate::pool_migration) fn rollback(mut self) -> rusqlite::Result<()> {
+            match &mut self.boundary {
+                Boundary::Immediate(transaction) => transaction
+                    .take()
+                    .expect("an active delivery write transaction owns its SQLite transaction")
+                    .rollback(),
+                Boundary::Savepoint { conn, name, active } => {
+                    conn.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"))?;
+                    *active = false;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    impl Drop for Transaction<'_> {
+        fn drop(&mut self) {
+            if let Boundary::Savepoint { conn, name, active } = &mut self.boundary
+                && *active
+            {
+                let _ = conn.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
+                *active = false;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "migration-delivery")]
+pub(in crate::pool_migration) use immediate_delivery_write::Transaction as ImmediateDeliveryWriteTransaction;
 
 #[cfg(feature = "migration-delivery")]
 impl ReservedImmediateArtifact for SqliteReservedImmediateArtifact {
@@ -622,37 +719,33 @@ impl<C: std::borrow::Borrow<rusqlite::Connection>, P, CL, R> crate::WalletDb<C, 
         f: F,
     ) -> Result<A, E>
     where
-        F: FnOnce(&mut crate::WalletDb<&rusqlite::Connection, &P, &CL, &mut R>) -> Result<A, E>,
+        F: FnOnce(
+            &mut crate::WalletDb<&rusqlite::Connection, &P, &CL, &mut R>,
+            &ImmediateDeliveryWriteTransaction<'_>,
+        ) -> Result<A, E>,
     {
         let conn = self.conn.borrow();
-        if conn.is_autocommit() {
-            let tx = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
+        let transaction = ImmediateDeliveryWriteTransaction::begin(conn)?;
+        let result = {
             let mut wallet_db = crate::WalletDb {
-                conn: &*tx,
+                conn: transaction.connection(),
                 params: &self.params,
                 clock: &self.clock,
                 rng: &mut self.rng,
                 #[cfg(feature = "transparent-inputs")]
                 gap_limits: self.gap_limits,
             };
-            let result = f(&mut wallet_db)?;
-            tx.commit()?;
-            Ok(result)
-        } else {
-            // The SDK materializer already owns the wallet transaction. Reuse it so exact
-            // transaction storage and the delivery CAS commit or roll back together.
-            let mut wallet_db = crate::WalletDb {
-                conn,
-                params: &self.params,
-                clock: &self.clock,
-                rng: &mut self.rng,
-                #[cfg(feature = "transparent-inputs")]
-                gap_limits: self.gap_limits,
-            };
-            f(&mut wallet_db)
+            f(&mut wallet_db, &transaction)
+        };
+        match result {
+            Ok(value) => {
+                transaction.commit()?;
+                Ok(value)
+            }
+            Err(error) => match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(E::from(rollback_error)),
+            },
         }
     }
 
@@ -671,7 +764,7 @@ impl<C: std::borrow::Borrow<rusqlite::Connection>, P, CL, R> crate::WalletDb<C, 
         P: zcash_protocol::consensus::Parameters,
     {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::claim_immediate(
@@ -701,7 +794,7 @@ impl<C: std::borrow::Borrow<rusqlite::Connection>, P, CL, R> crate::WalletDb<C, 
         P: zcash_protocol::consensus::Parameters,
     {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::set_immediate_phase(
@@ -737,7 +830,7 @@ where
         policy: &SubmissionPolicy,
         lease_duration: LeaseDuration,
     ) -> Result<Self::ReservedArtifact, Self::Error> {
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, transaction| {
             let context = SubmissionContext::from_parameters(wallet_db.params());
             if policy.request().context() != context {
                 return Err(orchard_ironwood::Error::DeliveryPolicyMismatch);
@@ -794,7 +887,7 @@ where
             let lease = store::checked_delivery_lease(ClaimKind::Materialization, lease_duration)?;
             let account_id = account.internal_id();
             let snapshot = store::reserve_immediate_delivery(
-                wallet_db.conn,
+                transaction,
                 &orchard_ironwood::TABLES,
                 account_id,
                 &proposal_envelope,
@@ -807,6 +900,7 @@ where
                 lease,
                 policy,
                 context,
+                intent.maximum_gross_amount(),
             )?;
             Ok(SqliteReservedImmediateArtifact {
                 proposal,
@@ -833,6 +927,37 @@ where
         })
     }
 
+    fn reacquire_failed_immediate_materialization(
+        &mut self,
+        account_id: &Self::AccountId,
+        expected_revision: DeliveryRevision,
+        run_identity: MigrationRunIdentity,
+        artifact_identity: ImmediateArtifactIdentity,
+        signer_ownership: SignerOwnership,
+        maximum_gross_amount: Zatoshis,
+        lease_duration: LeaseDuration,
+        expected_policy_fingerprint: PolicyFingerprint,
+    ) -> Result<DeliverySnapshot, Self::Error> {
+        let context = SubmissionContext::from_parameters(self.params());
+        self.immediate_delivery_transactionally(|wallet_db, transaction| {
+            let account_ref = store::account_ref(wallet_db.conn, account_id)?
+                .ok_or(orchard_ironwood::Error::AccountUnknown)?;
+            store::reacquire_failed_immediate_materialization(
+                transaction,
+                &orchard_ironwood::TABLES,
+                account_ref,
+                context,
+                expected_revision,
+                run_identity,
+                artifact_identity,
+                signer_ownership,
+                maximum_gross_amount,
+                lease_duration,
+                expected_policy_fingerprint,
+            )
+        })
+    }
+
     fn reacquire_immediate_external_signing(
         &mut self,
         account_id: &Self::AccountId,
@@ -843,7 +968,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<Option<DeliverySnapshot>, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::reacquire_immediate_external_signing(
@@ -871,7 +996,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account = wallet_db
                 .get_account(*account_id)
                 .map_err(orchard_ironwood::Error::Wallet)?
@@ -942,7 +1067,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::stage_immediate_signed_pczt(
@@ -970,7 +1095,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account = wallet_db
                 .get_account(*account_id)
                 .map_err(orchard_ironwood::Error::Wallet)?
@@ -1080,7 +1205,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<Option<DeliverySnapshot>, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::resume_immediate_claim(
@@ -1108,7 +1233,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<Option<DeliverySnapshot>, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::renew_immediate_claim(
@@ -1137,7 +1262,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::record_immediate_submission_outcome(
@@ -1164,7 +1289,7 @@ where
         token: ClaimToken,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::reconcile_immediate_submission(
@@ -1191,7 +1316,7 @@ where
         expected_policy_fingerprint: PolicyFingerprint,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::release_immediate_claim_known_unsent(
@@ -1246,7 +1371,7 @@ where
         run_identity: MigrationRunIdentity,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::begin_immediate_abandonment(
@@ -1267,7 +1392,7 @@ where
         run_identity: MigrationRunIdentity,
     ) -> Result<DeliverySnapshot, Self::Error> {
         let context = SubmissionContext::from_parameters(self.params());
-        self.immediate_delivery_transactionally(|wallet_db| {
+        self.immediate_delivery_transactionally(|wallet_db, _transaction| {
             let account_ref = store::account_ref(wallet_db.conn, account_id)?
                 .ok_or(orchard_ironwood::Error::AccountUnknown)?;
             store::finish_immediate_abandonment(

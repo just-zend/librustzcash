@@ -68,7 +68,7 @@ use {
         AccountMigrationRuntime, CanonicalMaterializationPurpose, CanonicalMaterializationReceipt,
         CanonicalMaterializationTransition, ClaimKind, ClaimStatus, ClaimToken,
         DeliveryArtifactEvidence, DeliveryArtifactIdentity, DeliveryClaim, DeliveryFailureReason,
-        DeliveryLease, DeliveryPhase, DeliveryRevision, DeliveryRunFingerprint,
+        DeliveryLane, DeliveryLease, DeliveryPhase, DeliveryRevision, DeliveryRunFingerprint,
         DeliverySchemaProvenance, DeliverySchemaVersion, DeliverySnapshot, DestinationSpendability,
         ExactTransaction, ExpiredTransferRebuild, ExpiredTransferRebuildReceipt,
         ExternalSigningPczt, FinalityArchive, FinalityAuditResult, FinalizedTransferEvidence,
@@ -225,6 +225,8 @@ pub(crate) struct Tables {
     pub delivery_run_archive: &'static str,
     /// Rust-owned reservation/delivery state for the SDK's immediate proposal lane.
     pub immediate_delivery: &'static str,
+    /// Versioned user-confirmed gross ceiling for each immediate proposal run.
+    pub immediate_gross_authorization: &'static str,
     /// Efficient lease expiry/relaunch reconciliation for immediate claims.
     pub immediate_lease_index: &'static str,
     /// One-time safety quarantine for legacy standalone-engine rows.
@@ -388,11 +390,131 @@ pub(crate) fn init(conn: &Connection, t: &Tables) -> rusqlite::Result<()> {
 /// Create Zend's additive, versioned delivery-control tables. This is intentionally called by a
 /// distinct wallet-schema migration after the canonical pool-migration tables already exist.
 #[cfg(feature = "migration-delivery")]
+fn immediate_gross_authorization_schema_sql(t: &Tables) -> String {
+    let authorization_version = DELIVERY_SCHEMA_V2_GROSS_AUTHORIZATION_VERSION;
+    let max_money = DELIVERY_SCHEMA_V2_MAX_MONEY;
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} (
+             run_identity BLOB PRIMARY KEY REFERENCES {}(run_identity) ON DELETE CASCADE,
+             authorization_version INTEGER NOT NULL CHECK (
+                 authorization_version = {authorization_version}
+             ),
+             maximum_gross_amount INTEGER NOT NULL CHECK (
+                 maximum_gross_amount BETWEEN 0 AND {max_money}
+             )
+         )",
+        t.immediate_gross_authorization, t.immediate_delivery,
+    )
+}
+
+#[cfg(feature = "migration-delivery")]
 fn delivery_control_schema_sql(t: &Tables) -> String {
-    let max_immediate_proposal_envelope =
-        zcash_pool_migration::delivery::MAX_IMMEDIATE_PROPOSAL_ENVELOPE_BYTES;
-    let max_exact_transaction = zcash_pool_migration::delivery::MAX_EXACT_TRANSACTION_BYTES;
-    let max_finality_archive = zcash_pool_migration::delivery::MAX_FINALITY_ARCHIVE_BYTES;
+    let immediate_gross_authorization_schema = format!(
+        "{};\n         ",
+        immediate_gross_authorization_schema_sql(t)
+    );
+    delivery_control_schema_sql_for(
+        t,
+        DELIVERY_SCHEMA_VERSION,
+        DELIVERY_SCHEMA_IMPLEMENTATION,
+        &immediate_gross_authorization_schema,
+        DELIVERY_SCHEMA_V2_MAX_IMMEDIATE_PROPOSAL_ENVELOPE,
+        DELIVERY_SCHEMA_V2_MAX_EXACT_TRANSACTION,
+        DELIVERY_SCHEMA_V2_MAX_FINALITY_ARCHIVE,
+    )
+}
+
+#[cfg(feature = "migration-delivery")]
+fn delivery_control_schema_v1_sql(t: &Tables) -> String {
+    // These are schema constants, not runtime tuning knobs. They are frozen to the exact values
+    // emitted by migration d14c3f72 at commit 98b51b18; changing the domain-layer limits later
+    // must not rewrite an already-published migration node.
+    const V1_MAX_IMMEDIATE_PROPOSAL_ENVELOPE: usize = 4_194_322;
+    const V1_MAX_EXACT_TRANSACTION: usize = 4_194_304;
+    const V1_MAX_FINALITY_ARCHIVE: usize = 16_777_216;
+    delivery_control_schema_sql_for(
+        t,
+        PREVIOUS_DELIVERY_SCHEMA_VERSION,
+        PREVIOUS_DELIVERY_SCHEMA_IMPLEMENTATION,
+        "",
+        V1_MAX_IMMEDIATE_PROPOSAL_ENVELOPE,
+        V1_MAX_EXACT_TRANSACTION,
+        V1_MAX_FINALITY_ARCHIVE,
+    )
+}
+
+#[cfg(feature = "migration-delivery")]
+fn delivery_control_schema_sql_for(
+    t: &Tables,
+    delivery_schema_version: u32,
+    delivery_schema_implementation: &str,
+    immediate_gross_authorization_schema: &str,
+    max_immediate_proposal_envelope: usize,
+    max_exact_transaction: usize,
+    max_finality_archive: usize,
+) -> String {
+    let immediate_finality_check = if delivery_schema_version == PREVIOUS_DELIVERY_SCHEMA_VERSION {
+        "(storage_finality = 'active' AND observed_mined_height IS NULL
+                     AND destination_output_index IS NULL
+                     AND expected_ironwood_amount IS NULL
+                     AND release_at_height IS NULL AND finalized_tip_height IS NULL)
+                 OR (storage_finality = 'complete_pending_finality'
+                     AND status = 'confirmed' AND observed_mined_height IS NOT NULL
+                     AND destination_output_index IS NOT NULL
+                     AND expected_ironwood_amount IS NOT NULL
+                     AND release_at_height IS NOT NULL
+                     AND release_at_height >= observed_mined_height
+                     AND finalized_tip_height IS NULL)
+                 OR (storage_finality = 'finalized' AND status = 'confirmed'
+                     AND observed_mined_height IS NOT NULL
+                     AND destination_output_index IS NOT NULL
+                     AND expected_ironwood_amount IS NOT NULL
+                     AND release_at_height IS NOT NULL
+                     AND release_at_height >= observed_mined_height
+                     AND finalized_tip_height IS NOT NULL
+                     AND finalized_tip_height >= release_at_height)
+                 OR (storage_finality = 'recovery_required'
+                     AND storage_recovery_reason IS NOT NULL
+                     AND (finalized_tip_height IS NULL
+                         OR (release_at_height IS NOT NULL
+                             AND finalized_tip_height >= release_at_height)))"
+    } else {
+        "(storage_finality = 'active' AND observed_mined_height IS NULL
+                     AND ((destination_output_index IS NULL
+                           AND expected_ironwood_amount IS NULL)
+                          OR (destination_output_index IS NOT NULL
+                              AND expected_ironwood_amount IS NOT NULL))
+                     AND release_at_height IS NULL AND finalized_tip_height IS NULL)
+                 OR (storage_finality = 'complete_pending_finality'
+                     AND status = 'confirmed' AND observed_mined_height IS NOT NULL
+                     AND destination_output_index IS NOT NULL
+                     AND expected_ironwood_amount IS NOT NULL
+                     AND release_at_height IS NOT NULL
+                     AND release_at_height >= observed_mined_height
+                     AND finalized_tip_height IS NULL)
+                 OR (storage_finality = 'finalized'
+                     AND release_at_height IS NOT NULL
+                     AND finalized_tip_height IS NOT NULL
+                     AND finalized_tip_height >= release_at_height
+                     AND ((status = 'confirmed'
+                           AND observed_mined_height IS NOT NULL
+                           AND destination_output_index IS NOT NULL
+                           AND expected_ironwood_amount IS NOT NULL
+                           AND release_at_height >= observed_mined_height)
+                          OR (status = 'expired_unmined'
+                              AND observed_mined_height IS NULL
+                              AND destination_output_index IS NOT NULL
+                              AND expected_ironwood_amount IS NOT NULL)
+                          OR (status IN ('external_signing_expired_unmined', 'abandoned')
+                              AND observed_mined_height IS NULL
+                              AND destination_output_index IS NULL
+                              AND expected_ironwood_amount IS NULL)))
+                 OR (storage_finality = 'recovery_required'
+                     AND storage_recovery_reason IS NOT NULL
+                     AND (finalized_tip_height IS NULL
+                         OR (release_at_height IS NOT NULL
+                             AND finalized_tip_height >= release_at_height)))"
+    };
     format!(
         "CREATE TABLE IF NOT EXISTS {} (
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -400,7 +522,7 @@ fn delivery_control_schema_sql(t: &Tables) -> String {
              implementation TEXT NOT NULL CHECK (length(implementation) BETWEEN 1 AND 128)
          );
          INSERT OR IGNORE INTO {} (singleton, schema_version, implementation)
-             VALUES (1, 1, 'just-zend/librustzcash-delivery-v1');
+             VALUES (1, {delivery_schema_version}, '{delivery_schema_implementation}');
          CREATE TABLE IF NOT EXISTS {} (
              run_identity BLOB PRIMARY KEY CHECK (length(run_identity) = 32),
              account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -993,37 +1115,14 @@ fn delivery_control_schema_sql(t: &Tables) -> String {
                  OR signed_pczt_digest IS NOT NULL
              ),
              CHECK (
-                 (storage_finality = 'active' AND observed_mined_height IS NULL
-                     AND destination_output_index IS NULL
-                     AND expected_ironwood_amount IS NULL
-                     AND release_at_height IS NULL AND finalized_tip_height IS NULL)
-                 OR (storage_finality = 'complete_pending_finality'
-                     AND status = 'confirmed' AND observed_mined_height IS NOT NULL
-                     AND destination_output_index IS NOT NULL
-                     AND expected_ironwood_amount IS NOT NULL
-                     AND release_at_height IS NOT NULL
-                     AND release_at_height >= observed_mined_height
-                     AND finalized_tip_height IS NULL)
-                 OR (storage_finality = 'finalized' AND status = 'confirmed'
-                     AND observed_mined_height IS NOT NULL
-                     AND destination_output_index IS NOT NULL
-                     AND expected_ironwood_amount IS NOT NULL
-                     AND release_at_height IS NOT NULL
-                     AND release_at_height >= observed_mined_height
-                     AND finalized_tip_height IS NOT NULL
-                     AND finalized_tip_height >= release_at_height)
-                 OR (storage_finality = 'recovery_required'
-                     AND storage_recovery_reason IS NOT NULL
-                     AND (finalized_tip_height IS NULL
-                         OR (release_at_height IS NOT NULL
-                             AND finalized_tip_height >= release_at_height)))
+                 {immediate_finality_check}
              ),
              CHECK (
                  storage_finality = 'recovery_required'
                  OR storage_recovery_reason IS NULL
              )
          );
-         CREATE TABLE IF NOT EXISTS {} (
+         {immediate_gross_authorization_schema}CREATE TABLE IF NOT EXISTS {} (
              run_identity BLOB PRIMARY KEY REFERENCES {}(run_identity) ON DELETE CASCADE,
              revision INTEGER NOT NULL CHECK (revision >= 1),
              state_fingerprint BLOB NOT NULL CHECK (length(state_fingerprint) = 32),
@@ -1223,11 +1322,196 @@ fn delivery_control_schema_sql(t: &Tables) -> String {
     )
 }
 
-/// Create Zend's additive, versioned delivery-control tables. This is intentionally called by a
-/// distinct wallet-schema migration after the canonical pool-migration tables already exist.
+/// Creates the immutable v1 schema owned by the original delivery-control wallet migration.
+/// Later migration nodes must advance this schema instead of changing the historical node's body.
 #[cfg(feature = "migration-delivery")]
 pub(crate) fn init_delivery_control(conn: &Connection, t: &Tables) -> rusqlite::Result<()> {
+    conn.execute_batch(&delivery_control_schema_v1_sql(t))
+}
+
+/// Creates the current schema directly for focused runtime tests.
+#[cfg(all(feature = "migration-delivery", test))]
+pub(crate) fn init_current_delivery_control(conn: &Connection, t: &Tables) -> rusqlite::Result<()> {
     conn.execute_batch(&delivery_control_schema_sql(t))
+}
+
+#[cfg(feature = "migration-delivery")]
+fn upgrade_immediate_delivery_table_v2(
+    transaction: &rusqlite::Transaction<'_>,
+    t: &Tables,
+) -> Result<(), Error> {
+    const COLUMNS: &str = "run_identity, revision, phase, artifact_identity,
+        proposal_fingerprint, canonical_proposal, signer_ownership, status, claim_kind,
+        attempt_token, lease_clock_session, lease_acquired_at_ms, lease_expires_at_ms, txid,
+        exact_tx, exact_tx_digest, unsigned_pczt_digest, canonical_unsigned_pczt,
+        signed_pczt_digest, canonical_signed_pczt, signed_pczt_binding, last_error, expiry_height,
+        storage_finality, storage_recovery_reason, observed_mined_height,
+        destination_output_index, expected_ironwood_amount, release_at_height,
+        finalized_tip_height, policy, policy_fingerprint, policy_validation_failure";
+
+    let backup = format!("{}_v1_upgrade", t.immediate_delivery);
+    if sqlite_object_exists(transaction, &backup)? {
+        return Err(Error::Corrupt("delivery v1 immediate upgrade residue"));
+    }
+    let batch = delivery_control_schema_sql(t);
+    let create_table = compiled_table_sql(&batch, t.immediate_delivery)
+        .ok_or(Error::Corrupt("compiled immediate delivery schema"))?;
+    let create_index = compiled_index_sql(&batch, t.immediate_lease_index)
+        .ok_or(Error::Corrupt("compiled immediate lease index"))?;
+    let run_delete_guard = compiled_trigger_sql(&batch, t.delivery_run_delete_guard)
+        .ok_or(Error::Corrupt("compiled delivery run delete guard"))?;
+    let account_delete_guard = compiled_trigger_sql(&batch, t.delivery_account_delete_guard)
+        .ok_or(Error::Corrupt("compiled delivery account delete guard"))?;
+    let expected_rows: u64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM {}", t.immediate_delivery),
+        [],
+        |row| row.get(0),
+    )?;
+    transaction.execute_batch(&format!(
+        "DROP TRIGGER {};
+         DROP TRIGGER {};
+         DROP INDEX {};
+         ALTER TABLE {} RENAME TO {};
+         {create_table};",
+        t.delivery_run_delete_guard,
+        t.delivery_account_delete_guard,
+        t.immediate_lease_index,
+        t.immediate_delivery,
+        backup,
+    ))?;
+    let copied_rows = transaction.execute(
+        &format!(
+            "INSERT INTO {} ({COLUMNS}) SELECT {COLUMNS} FROM {}",
+            t.immediate_delivery, backup,
+        ),
+        [],
+    )?;
+    let actual_rows: u64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM {}", t.immediate_delivery),
+        [],
+        |row| row.get(0),
+    )?;
+    let copy_differs: bool = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT {COLUMNS} FROM {backup}
+                            EXCEPT SELECT {COLUMNS} FROM {})
+                 OR EXISTS(SELECT {COLUMNS} FROM {}
+                            EXCEPT SELECT {COLUMNS} FROM {backup})",
+            t.immediate_delivery, t.immediate_delivery,
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    if u64::try_from(copied_rows).ok() != Some(expected_rows)
+        || actual_rows != expected_rows
+        || copy_differs
+    {
+        return Err(Error::Corrupt("delivery v2 immediate row copy"));
+    }
+    transaction.execute_batch(&format!(
+        "DROP TABLE {backup};
+         {create_index};
+         {run_delete_guard};
+         {account_delete_guard};",
+    ))?;
+    Ok(())
+}
+
+/// Advances the exact Zend delivery schema from v1 to v2 without inventing spend authority for
+/// legacy immediate rows.
+///
+/// The immediate table is rebuilt with v2's coherent active exact-evidence constraint and the
+/// companion authorization table is created empty before provenance advances. Because wallet
+/// migrations pass their transaction directly, any failure rolls back the table replacement, the
+/// new authorization table, and the provenance CAS. The v1 authority schema is fully audited
+/// first; missing or malformed objects are never repaired by replaying the full schema.
+#[cfg(feature = "migration-delivery")]
+pub(crate) fn upgrade_immediate_gross_authorization(
+    transaction: &rusqlite::Transaction<'_>,
+    t: &Tables,
+) -> Result<(), Error> {
+    let rows = {
+        let mut stmt = transaction.prepare(&format!(
+            "SELECT singleton, schema_version, implementation FROM {}",
+            t.delivery_meta
+        ))?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let [(singleton, version, implementation)] = rows.as_slice() else {
+        return Err(Error::Corrupt("delivery schema provenance"));
+    };
+    if *singleton != 1 {
+        return Err(Error::Corrupt("delivery schema provenance"));
+    }
+
+    match (*version, implementation.as_str()) {
+        (version, implementation)
+            if version == i64::from(DELIVERY_SCHEMA_VERSION)
+                && implementation == DELIVERY_SCHEMA_IMPLEMENTATION =>
+        {
+            return if delivery_schema_v2_integrity_matches(transaction, t)? {
+                Ok(())
+            } else {
+                Err(Error::DeliverySchemaIncompatible)
+            };
+        }
+        (version, implementation)
+            if version == i64::from(PREVIOUS_DELIVERY_SCHEMA_VERSION)
+                && implementation == PREVIOUS_DELIVERY_SCHEMA_IMPLEMENTATION =>
+        {
+            if sqlite_object_exists(transaction, t.immediate_gross_authorization)? {
+                return Err(Error::Corrupt("delivery v1 unexpected gross authorization"));
+            }
+            if !delivery_lock_schema_matches(transaction)? {
+                return Err(Error::Corrupt("delivery v1 lock schema"));
+            }
+            if !delivery_schema_shape_matches_with_authorization(transaction, t, false)? {
+                return Err(Error::Corrupt("delivery v1 schema shape"));
+            }
+            if !delivery_run_authority_matches(transaction, t)? {
+                return Err(Error::Corrupt("delivery v1 run authority"));
+            }
+            if !delivery_relations_are_coherent(transaction, t)? {
+                return Err(Error::Corrupt("delivery v1 relations"));
+            }
+            if delivery_authority_has_foreign_key_violation(transaction, t, false)? {
+                return Err(Error::Corrupt("delivery v1 foreign-key integrity"));
+            }
+            upgrade_immediate_delivery_table_v2(transaction, t)?;
+            transaction
+                .execute_batch(&format!("{};", immediate_gross_authorization_schema_sql(t)))?;
+            let changed = transaction.execute(
+                &format!(
+                    "UPDATE {} SET schema_version = ?, implementation = ?
+                     WHERE singleton = 1 AND schema_version = ? AND implementation = ?",
+                    t.delivery_meta
+                ),
+                params![
+                    DELIVERY_SCHEMA_VERSION,
+                    DELIVERY_SCHEMA_IMPLEMENTATION,
+                    PREVIOUS_DELIVERY_SCHEMA_VERSION,
+                    PREVIOUS_DELIVERY_SCHEMA_IMPLEMENTATION,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(Error::Corrupt("delivery schema provenance transition"));
+            }
+        }
+        _ => return Err(Error::DeliverySchemaIncompatible),
+    }
+
+    if delivery_schema_v2_integrity_matches(transaction, t)? {
+        Ok(())
+    } else {
+        Err(Error::DeliverySchemaIncompatible)
+    }
 }
 
 /// Records immutable detection evidence for every retired standalone-engine SQLite object. The old
@@ -1298,7 +1582,33 @@ pub(crate) fn quarantine_legacy_engine_state(
 }
 
 #[cfg(feature = "migration-delivery")]
-const DELIVERY_SCHEMA_VERSION: u32 = 1;
+const DELIVERY_SCHEMA_VERSION: u32 = 2;
+
+#[cfg(feature = "migration-delivery")]
+const DELIVERY_SCHEMA_IMPLEMENTATION: &str = "just-zend/librustzcash-delivery-v2";
+
+#[cfg(feature = "migration-delivery")]
+const PREVIOUS_DELIVERY_SCHEMA_VERSION: u32 = 1;
+
+#[cfg(feature = "migration-delivery")]
+const PREVIOUS_DELIVERY_SCHEMA_IMPLEMENTATION: &str = "just-zend/librustzcash-delivery-v1";
+
+#[cfg(feature = "migration-delivery")]
+const IMMEDIATE_GROSS_AUTHORIZATION_VERSION: u32 = 1;
+
+// The v2 DDL is immutable once published. Runtime/domain constants are asserted against these
+// values in tests, but changing a runtime bound must produce a v3 migration rather than silently
+// changing provenance for already-installed v2 wallets.
+#[cfg(feature = "migration-delivery")]
+const DELIVERY_SCHEMA_V2_GROSS_AUTHORIZATION_VERSION: u32 = 1;
+#[cfg(feature = "migration-delivery")]
+const DELIVERY_SCHEMA_V2_MAX_MONEY: u64 = 2_100_000_000_000_000;
+#[cfg(feature = "migration-delivery")]
+const DELIVERY_SCHEMA_V2_MAX_IMMEDIATE_PROPOSAL_ENVELOPE: usize = 4_194_322;
+#[cfg(feature = "migration-delivery")]
+const DELIVERY_SCHEMA_V2_MAX_EXACT_TRANSACTION: usize = 4_194_304;
+#[cfg(feature = "migration-delivery")]
+const DELIVERY_SCHEMA_V2_MAX_FINALITY_ARCHIVE: usize = 16_777_216;
 
 #[cfg(feature = "migration-delivery")]
 fn sqlite_object_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -1333,13 +1643,45 @@ fn compiled_trigger_sql<'a>(batch: &'a str, name: &str) -> Option<&'a str> {
     Some(tail[..end].trim())
 }
 
-/// Verifies the exact v1 DDL, rather than accepting a collection of look-alike object names. This
+#[cfg(feature = "migration-delivery")]
+fn compiled_table_sql<'a>(batch: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("CREATE TABLE IF NOT EXISTS {name} ");
+    batch
+        .split(';')
+        .map(str::trim)
+        .find(|statement| statement.starts_with(&prefix))
+}
+
+#[cfg(feature = "migration-delivery")]
+fn compiled_index_sql<'a>(batch: &'a str, name: &str) -> Option<&'a str> {
+    let unique_prefix = format!("CREATE UNIQUE INDEX IF NOT EXISTS {name} ");
+    let prefix = format!("CREATE INDEX IF NOT EXISTS {name} ");
+    batch
+        .split(';')
+        .map(str::trim)
+        .find(|statement| statement.starts_with(&unique_prefix) || statement.starts_with(&prefix))
+}
+
+/// Verifies the exact current DDL, rather than accepting a collection of look-alike object names. This
 /// pins column order/types/nullability/defaults, every CHECK expression, primary/unique keys, and
 /// declared foreign-key targets/actions to the Rust-owned schema text used by the migration.
 #[cfg(feature = "migration-delivery")]
 fn delivery_schema_shape_matches(conn: &Connection, t: &Tables) -> Result<bool, Error> {
-    let batch = delivery_control_schema_sql(t);
-    for table in [
+    delivery_schema_shape_matches_with_authorization(conn, t, true)
+}
+
+#[cfg(feature = "migration-delivery")]
+fn delivery_schema_shape_matches_with_authorization(
+    conn: &Connection,
+    t: &Tables,
+    require_gross_authorization_table: bool,
+) -> Result<bool, Error> {
+    let batch = if require_gross_authorization_table {
+        delivery_control_schema_sql(t)
+    } else {
+        delivery_control_schema_v1_sql(t)
+    };
+    let mut tables = vec![
         t.delivery_meta,
         t.delivery_runs,
         t.delivery_control,
@@ -1350,7 +1692,11 @@ fn delivery_schema_shape_matches(conn: &Connection, t: &Tables) -> Result<bool, 
         t.immediate_delivery,
         t.delivery_run_archive,
         t.legacy_quarantine,
-    ] {
+    ];
+    if require_gross_authorization_table {
+        tables.push(t.immediate_gross_authorization);
+    }
+    for table in tables {
         let prefix = format!("CREATE TABLE IF NOT EXISTS {table} ");
         let expected = batch
             .split(';')
@@ -1432,7 +1778,7 @@ fn delivery_schema_shape_matches(conn: &Connection, t: &Tables) -> Result<bool, 
         }
     }
 
-    for (table, columns) in [
+    let mut unique_keys = vec![
         (t.delivery_runs, &["run_identity"][..]),
         (t.delivery_control, &["run_identity"][..]),
         (
@@ -1451,7 +1797,11 @@ fn delivery_schema_shape_matches(conn: &Connection, t: &Tables) -> Result<bool, 
             t.legacy_quarantine,
             &["source_object", "schema_fingerprint"][..],
         ),
-    ] {
+    ];
+    if require_gross_authorization_table {
+        unique_keys.push((t.immediate_gross_authorization, &["run_identity"][..]));
+    }
+    for (table, columns) in unique_keys {
         if !has_unique_index(conn, table, columns)? {
             return Ok(false);
         }
@@ -1966,6 +2316,115 @@ fn delivery_relations_are_coherent(conn: &Connection, t: &Tables) -> Result<bool
 }
 
 #[cfg(feature = "migration-delivery")]
+fn delivery_authority_has_foreign_key_violation(
+    conn: &Connection,
+    t: &Tables,
+    include_gross_authorization_table: bool,
+) -> Result<bool, Error> {
+    let mut authority_tables = vec![
+        t.delivery_runs,
+        t.delivery_control,
+        t.delivery_claims,
+        t.delivery_reservations,
+        t.delivery_evidence,
+        t.delivery_attempt_archive,
+        t.immediate_delivery,
+        t.delivery_run_archive,
+    ];
+    if include_gross_authorization_table {
+        authority_tables.push(t.immediate_gross_authorization);
+    }
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let table = row.get::<_, String>(0)?;
+        if authority_tables.contains(&table.as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(feature = "migration-delivery")]
+fn immediate_gross_authorizations_are_coherent(
+    conn: &Connection,
+    t: &Tables,
+) -> Result<bool, Error> {
+    let rows = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT authorization.authorization_version,
+                    authorization.maximum_gross_amount, immediate.canonical_proposal
+               FROM {} authorization
+               JOIN {} immediate ON immediate.run_identity = authorization.run_identity
+              ORDER BY authorization.run_identity",
+            t.immediate_gross_authorization, t.immediate_delivery
+        ))?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    for (version, maximum, canonical_proposal) in rows {
+        if version != i64::from(IMMEDIATE_GROSS_AUTHORIZATION_VERSION) {
+            return Ok(false);
+        }
+        let Ok(maximum) = u64::try_from(maximum) else {
+            return Ok(false);
+        };
+        let Ok(maximum) = Zatoshis::from_u64(maximum) else {
+            return Ok(false);
+        };
+        let Ok((_, proposal_gross_amount)) = immediate_proposal_authority(&canonical_proposal)
+        else {
+            return Ok(false);
+        };
+        if proposal_gross_amount > maximum {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Performs the exact v2 structural and relational audit used inside wallet migrations, where
+/// SQLite's foreign-key enforcement pragma may be temporarily disabled and cannot be changed until
+/// the surrounding transaction commits. Declared foreign keys and their data integrity are still
+/// checked exactly; only the connection-level enforcement state is omitted here. Runtime
+/// provenance separately requires enforcement to be active.
+#[cfg(feature = "migration-delivery")]
+fn delivery_schema_v2_integrity_matches(conn: &Connection, t: &Tables) -> Result<bool, Error> {
+    let provenance_rows = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT singleton, schema_version, implementation FROM {}",
+            t.delivery_meta
+        ))?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let [(singleton, version, implementation)] = provenance_rows.as_slice() else {
+        return Ok(false);
+    };
+    Ok(*singleton == 1
+        && *version == i64::from(DELIVERY_SCHEMA_VERSION)
+        && implementation == DELIVERY_SCHEMA_IMPLEMENTATION
+        && delivery_lock_schema_matches(conn)?
+        && delivery_schema_shape_matches(conn, t)?
+        && delivery_run_authority_matches(conn, t)?
+        && delivery_relations_are_coherent(conn, t)?
+        && immediate_gross_authorizations_are_coherent(conn, t)?
+        && !delivery_authority_has_foreign_key_violation(conn, t, true)?)
+}
+
+#[cfg(feature = "migration-delivery")]
 pub(super) fn delivery_schema_provenance(
     conn: &Connection,
     t: &Tables,
@@ -2003,7 +2462,7 @@ pub(super) fn delivery_schema_provenance(
     let version = DeliverySchemaVersion::from_u32(version)
         .ok_or(Error::Corrupt("delivery schema version"))?;
     let provenance = if version.as_u32() == DELIVERY_SCHEMA_VERSION {
-        if implementation == "just-zend/librustzcash-delivery-v1" {
+        if implementation == DELIVERY_SCHEMA_IMPLEMENTATION {
             DeliverySchemaProvenance::Compatible(version)
         } else {
             DeliverySchemaProvenance::Corrupt
@@ -2020,32 +2479,11 @@ pub(super) fn delivery_schema_provenance(
         || !delivery_schema_shape_matches(conn, t)?
         || !delivery_run_authority_matches(conn, t)?
         || !delivery_relations_are_coherent(conn, t)?
+        || !immediate_gross_authorizations_are_coherent(conn, t)?
     {
         return Ok(DeliverySchemaProvenance::Corrupt);
     }
-    let authority_tables = [
-        t.delivery_runs,
-        t.delivery_control,
-        t.delivery_claims,
-        t.delivery_reservations,
-        t.delivery_evidence,
-        t.delivery_attempt_archive,
-        t.immediate_delivery,
-        t.delivery_run_archive,
-    ];
-    let foreign_key_violation = {
-        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
-        let mut rows = stmt.query([])?;
-        let mut found = false;
-        while let Some(row) = rows.next()? {
-            let table = row.get::<_, String>(0)?;
-            if authority_tables.contains(&table.as_str()) {
-                found = true;
-                break;
-            }
-        }
-        found
-    };
+    let foreign_key_violation = delivery_authority_has_foreign_key_violation(conn, t, true)?;
     Ok(if foreign_key_violation {
         DeliverySchemaProvenance::Corrupt
     } else {
@@ -7810,6 +8248,8 @@ struct StoredImmediateDelivery {
     policy: Option<Vec<u8>>,
     policy_fingerprint: Option<[u8; 32]>,
     policy_validation_failure: Option<String>,
+    authorization_version: Option<i64>,
+    maximum_gross_amount: Option<i64>,
 }
 
 #[cfg(feature = "migration-delivery")]
@@ -7836,11 +8276,13 @@ fn read_stored_immediate_delivery(
                     immediate.destination_output_index, immediate.expected_ironwood_amount,
                     immediate.release_at_height, immediate.finalized_tip_height,
                     immediate.policy, immediate.policy_fingerprint,
-                    immediate.policy_validation_failure
+                    immediate.policy_validation_failure, authorization.authorization_version,
+                    authorization.maximum_gross_amount
                FROM {} runs
                JOIN {} immediate ON immediate.run_identity = runs.run_identity
+               LEFT JOIN {} authorization ON authorization.run_identity = runs.run_identity
               WHERE runs.run_identity = ? AND runs.account_id = ? AND runs.lane = 'immediate'",
-            tables.delivery_runs, tables.immediate_delivery
+            tables.delivery_runs, tables.immediate_delivery, tables.immediate_gross_authorization
         ),
         params![run_identity.as_bytes(), account_id.0],
         |row| {
@@ -7881,6 +8323,8 @@ fn read_stored_immediate_delivery(
                 policy: row.get(33)?,
                 policy_fingerprint: row.get(34)?,
                 policy_validation_failure: row.get(35)?,
+                authorization_version: row.get(36)?,
+                maximum_gross_amount: row.get(37)?,
             })
         },
     )
@@ -7969,6 +8413,23 @@ fn read_immediate_delivery_snapshot(
     if evidence.canonical_proposal() != row.canonical_proposal {
         return Err(Error::DeliveryArtifactMismatch);
     }
+    let (_, proposal_gross_amount) = immediate_proposal_authority(evidence.canonical_proposal())?;
+    let immediate_maximum_gross_amount = match (row.authorization_version, row.maximum_gross_amount)
+    {
+        (None, None) => None,
+        (Some(version), Some(maximum))
+            if version == i64::from(IMMEDIATE_GROSS_AUTHORIZATION_VERSION) =>
+        {
+            let maximum = u64::try_from(maximum)
+                .map_err(|_| Error::Corrupt("immediate gross authorization"))?;
+            let maximum = Zatoshis::from_u64(maximum)?;
+            if proposal_gross_amount > maximum {
+                return Err(Error::DeliveryArtifactMismatch);
+            }
+            Some(maximum)
+        }
+        _ => return Err(Error::Corrupt("immediate gross authorization tuple")),
+    };
     let policy_fingerprint = row
         .policy_fingerprint
         .map(|bytes| {
@@ -8154,7 +8615,7 @@ fn read_immediate_delivery_snapshot(
         }
         _ => None,
     };
-    let snapshot = DeliverySnapshot::from_parts(
+    let snapshot = DeliverySnapshot::from_parts_with_immediate_gross_authorization(
         revision,
         run_identity,
         DeliveryRunFingerprint::Immediate(proposal.digest()),
@@ -8165,6 +8626,7 @@ fn read_immediate_delivery_snapshot(
         finality_archive,
         policy,
         policy_failure,
+        immediate_maximum_gross_amount,
         claims,
     )
     .map_err(|_| Error::Corrupt("immediate delivery snapshot"))?;
@@ -8232,11 +8694,63 @@ fn reconcile_immediate_delivery(
     let expiry = claim.expiry_height();
     let lease = claim.lease();
     let signer = claim.signer_ownership();
+    let has_spend_authorization = snapshot.immediate_maximum_gross_amount().is_some();
     let storage_finality = snapshot.storage_finality();
     let source_owner = snapshot.source_reservation_owner();
     let now = delivery_clock_now();
     let fully_scanned = fully_scanned_height(conn)?;
     let mut changed = false;
+
+    let destination_evidence: (Option<u32>, Option<u64>) = conn.query_row(
+        &format!(
+            "SELECT destination_output_index, expected_ironwood_amount
+               FROM {} WHERE run_identity = ?",
+            tables.immediate_delivery
+        ),
+        params![run_identity.as_bytes()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let destination_evidence_complete = matches!(destination_evidence, (Some(_), Some(_)));
+    let destination_evidence_partial =
+        matches!(destination_evidence, (Some(_), None) | (None, Some(_)));
+    if !matches!(storage_finality, StorageFinality::RecoveryRequired(_))
+        && (destination_evidence_partial || exact.is_some() != destination_evidence_complete)
+    {
+        conn.execute(
+            &format!(
+                "UPDATE {} SET storage_finality = 'recovery_required',
+                 storage_recovery_reason = 'corrupt_finality_evidence'
+                 WHERE run_identity = ?",
+                tables.immediate_delivery
+            ),
+            params![run_identity.as_bytes()],
+        )?;
+        conn.execute(
+            &format!(
+                "UPDATE {} SET status = 'recovery_required' WHERE run_identity = ?",
+                tables.delivery_runs
+            ),
+            params![run_identity.as_bytes()],
+        )?;
+        conn.execute(
+            &format!(
+                "UPDATE {} SET status = 'recovery_required' WHERE run_identity = ?",
+                tables.delivery_reservations
+            ),
+            params![run_identity.as_bytes()],
+        )?;
+        bump_immediate_revision(conn, tables, run_identity)?;
+        return Ok(());
+    }
+
+    // Recovery authority is absorbing. Once either this reconciliation pass or an earlier one
+    // has quarantined the row, no lease, chain-observation, expiry, or finality transition may
+    // reinterpret it. In particular, a legacy exact transaction with no destination tuple is
+    // admitted structurally by v2 so it can be quarantined; a later load must not then attempt a
+    // `complete_pending_finality` write that v2 correctly rejects for the missing destination.
+    if matches!(storage_finality, StorageFinality::RecoveryRequired(_)) {
+        return Ok(());
+    }
 
     if let StorageFinality::Finalized(release) = storage_finality {
         let observed_height = exact
@@ -8248,8 +8762,20 @@ fn reconcile_immediate_delivery(
             .finality_archive()
             .and_then(|archive| archive.transfers().first())
             .map(|transfer| transfer.mined_height());
+        let terminal_evidence_is_consistent = match status {
+            ClaimStatus::Confirmed => {
+                exact.is_some() && archived_height.is_some() && observed_height == archived_height
+            }
+            ClaimStatus::ExpiredUnmined => {
+                exact.is_some() && observed_height.is_none() && archived_height.is_none()
+            }
+            ClaimStatus::ExternalSigningExpiredUnmined => {
+                exact.is_none() && observed_height.is_none() && archived_height.is_none()
+            }
+            _ => false,
+        };
         let active_chain_is_consistent = fully_scanned.is_some_and(|height| {
-            height >= release.release_at() && exact.is_some() && observed_height == archived_height
+            height >= release.release_at() && terminal_evidence_is_consistent
         });
         if !active_chain_is_consistent {
             conn.execute(
@@ -8285,28 +8811,43 @@ fn reconcile_immediate_delivery(
     {
         match status {
             ClaimStatus::Materializing => {
-                let duration_ms = lease
-                    .expires_at()
-                    .tick_millis()
-                    .checked_sub(lease.acquired_at().tick_millis())
-                    .and_then(LeaseDuration::from_millis)
-                    .ok_or(Error::Corrupt("immediate materialization lease duration"))?;
-                let replacement = checked_delivery_lease(ClaimKind::Materialization, duration_ms)?;
-                conn.execute(
-                    &format!(
-                        "UPDATE {} SET attempt_token = ?, lease_clock_session = ?,
-                         lease_acquired_at_ms = ?, lease_expires_at_ms = ?
-                         WHERE run_identity = ?",
-                        tables.immediate_delivery
-                    ),
-                    params![
-                        replacement.token().as_bytes(),
-                        replacement.acquired_at().session().as_bytes(),
-                        replacement.acquired_at().tick_millis(),
-                        replacement.expires_at().tick_millis(),
-                        run_identity.as_bytes(),
-                    ],
-                )?;
+                if has_spend_authorization {
+                    let duration_ms = lease
+                        .expires_at()
+                        .tick_millis()
+                        .checked_sub(lease.acquired_at().tick_millis())
+                        .and_then(LeaseDuration::from_millis)
+                        .ok_or(Error::Corrupt("immediate materialization lease duration"))?;
+                    let replacement =
+                        checked_delivery_lease(ClaimKind::Materialization, duration_ms)?;
+                    conn.execute(
+                        &format!(
+                            "UPDATE {} SET attempt_token = ?, lease_clock_session = ?,
+                             lease_acquired_at_ms = ?, lease_expires_at_ms = ?
+                             WHERE run_identity = ?",
+                            tables.immediate_delivery
+                        ),
+                        params![
+                            replacement.token().as_bytes(),
+                            replacement.acquired_at().session().as_bytes(),
+                            replacement.acquired_at().tick_millis(),
+                            replacement.expires_at().tick_millis(),
+                            run_identity.as_bytes(),
+                        ],
+                    )?;
+                } else {
+                    conn.execute(
+                        &format!(
+                            "UPDATE {} SET status = 'materialization_failed', claim_kind = NULL,
+                             attempt_token = NULL, lease_clock_session = NULL,
+                             lease_acquired_at_ms = NULL, lease_expires_at_ms = NULL,
+                             last_error = 'materialization_lease_expired'
+                             WHERE run_identity = ?",
+                            tables.immediate_delivery
+                        ),
+                        params![run_identity.as_bytes()],
+                    )?;
+                }
                 changed = true;
             }
             ClaimStatus::AwaitingExternalSignature => {
@@ -8487,10 +9028,10 @@ fn reconcile_immediate_delivery(
             }
             changed = true;
         } else if exact.is_some()
-            && matches!(
+            && (matches!(
                 status,
                 ClaimStatus::Submitting | ClaimStatus::OutcomeUnknown | ClaimStatus::Broadcasted
-            )
+            ) || (signer == SignerOwnership::External && status == ClaimStatus::Staged))
         {
             conn.execute(
                 &format!(
@@ -8582,7 +9123,7 @@ pub(super) fn load_immediate_delivery_runtime_parts(
 #[cfg(feature = "migration-delivery")]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reserve_immediate_delivery(
-    conn: &Connection,
+    transaction: &super::ImmediateDeliveryWriteTransaction<'_>,
     tables: &Tables,
     account_id: AccountRef,
     proposal: &ImmediateProposal,
@@ -8595,7 +9136,9 @@ pub(super) fn reserve_immediate_delivery(
     lease: DeliveryLease,
     policy: &SubmissionPolicy,
     submission_context: SubmissionContext,
+    maximum_gross_amount: Zatoshis,
 ) -> Result<DeliverySnapshot, Error> {
+    let conn = transaction.connection();
     if !matches!(
         delivery_schema_provenance(conn, tables)?,
         DeliverySchemaProvenance::Compatible(_)
@@ -8634,11 +9177,14 @@ pub(super) fn reserve_immediate_delivery(
         return Err(Error::DeliveryArtifactMismatch);
     }
     let supplied_sources = sources.iter().copied().collect::<BTreeSet<_>>();
-    if supplied_sources.len() != sources.len()
-        || supplied_sources != immediate_proposal_sources(evidence.canonical_proposal())?
-    {
+    let (proposal_sources, proposal_gross_amount) =
+        immediate_proposal_authority(evidence.canonical_proposal())?;
+    if supplied_sources.len() != sources.len() || supplied_sources != proposal_sources {
         return Err(Error::DeliveryArtifactMismatch);
     }
+    require_immediate_gross_authorization(proposal_gross_amount, maximum_gross_amount)?;
+    let stored_maximum_gross_amount = i64::try_from(maximum_gross_amount.into_u64())
+        .map_err(|_| Error::Corrupt("immediate gross authorization"))?;
     let live_run_exists = conn.query_row(
         &format!(
             "SELECT EXISTS(SELECT 1 FROM {} WHERE account_id = ?
@@ -8711,6 +9257,18 @@ pub(super) fn reserve_immediate_delivery(
             u32::from(evidence.expiry_height()),
             policy.canonical_bytes(),
             policy.fingerprint().as_bytes(),
+        ],
+    )?;
+    conn.execute(
+        &format!(
+            "INSERT INTO {} (run_identity, authorization_version, maximum_gross_amount)
+             VALUES (?, ?, ?)",
+            tables.immediate_gross_authorization
+        ),
+        params![
+            run_identity.as_bytes(),
+            IMMEDIATE_GROSS_AUTHORIZATION_VERSION,
+            stored_maximum_gross_amount,
         ],
     )?;
     upsert_source_reservations(conn, tables, sources, run_identity)?;
@@ -8806,6 +9364,73 @@ fn require_immediate_context(
     Ok(snapshot)
 }
 
+/// Requires active finality and exact active run/reservation authority before an immediate run may
+/// advance toward new external exposure.
+#[cfg(feature = "migration-delivery")]
+fn require_immediate_forward_exposure_context(
+    conn: &Connection,
+    tables: &Tables,
+    snapshot: &DeliverySnapshot,
+) -> Result<(), Error> {
+    if snapshot.lane() != DeliveryLane::Immediate
+        || snapshot.storage_finality() != StorageFinality::Active
+        || snapshot.active_source_reservation_count() == 0
+    {
+        return Err(Error::DeliveryRecoveryRequired);
+    }
+    let authority = conn
+        .query_row(
+            &format!(
+                "SELECT runs.status,
+                        (SELECT COUNT(*) FROM {} reservations
+                          WHERE reservations.run_identity = runs.run_identity),
+                        (SELECT COUNT(*) FROM {} reservations
+                          WHERE reservations.run_identity = runs.run_identity
+                            AND reservations.status = 'active')
+                   FROM {} runs WHERE runs.run_identity = ? AND runs.lane = 'immediate'",
+                tables.delivery_reservations, tables.delivery_reservations, tables.delivery_runs,
+            ),
+            params![snapshot.run_identity().as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((run_status, reservation_count, active_reservation_count)) = authority else {
+        return Err(Error::DeliveryRecoveryRequired);
+    };
+    if run_status != "active"
+        || reservation_count == 0
+        || reservation_count != active_reservation_count
+        || active_reservation_count != snapshot.active_source_reservation_count()
+        || !immediate_reservations_are_complete(conn, tables, snapshot.run_identity())?
+    {
+        return Err(Error::DeliveryRecoveryRequired);
+    }
+    Ok(())
+}
+
+/// Additionally requires the durable, versioned gross-spend authorization. Legacy rows remain
+/// readable and may reconcile or unwind, but cannot use proposal bytes as a substitute for user
+/// consent. The exact unexposed materialization-failure path may persist fresh authorization only
+/// after independently satisfying the forward-exposure context and its stricter retry predicates.
+#[cfg(feature = "migration-delivery")]
+fn require_immediate_spend_authorization(
+    conn: &Connection,
+    tables: &Tables,
+    snapshot: &DeliverySnapshot,
+) -> Result<(), Error> {
+    require_immediate_forward_exposure_context(conn, tables, snapshot)?;
+    snapshot
+        .immediate_maximum_gross_amount()
+        .map(|_| ())
+        .ok_or(Error::DeliveryRecoveryRequired)
+}
+
 #[cfg(feature = "migration-delivery")]
 fn immediate_snapshot_after_mutation(
     conn: &Connection,
@@ -8816,6 +9441,121 @@ fn immediate_snapshot_after_mutation(
 ) -> Result<DeliverySnapshot, Error> {
     read_immediate_delivery_snapshot(conn, tables, account_id, run_identity, submission_context)
         .map(|(snapshot, _)| snapshot)
+}
+
+/// Reissues only the bounded materialization capability for one exact, unexposed, known-unsent
+/// immediate failure. The enclosing wallet transaction makes the authorization predicate and
+/// revision bump one compare-and-swap; proposal evidence, reservations, and identities are never
+/// rewritten.
+#[cfg(feature = "migration-delivery")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reacquire_failed_immediate_materialization(
+    transaction: &super::ImmediateDeliveryWriteTransaction<'_>,
+    tables: &Tables,
+    account_id: AccountRef,
+    submission_context: SubmissionContext,
+    expected_revision: DeliveryRevision,
+    run_identity: MigrationRunIdentity,
+    artifact_identity: ImmediateArtifactIdentity,
+    signer_ownership: SignerOwnership,
+    maximum_gross_amount: Zatoshis,
+    lease_duration: LeaseDuration,
+    expected_policy_fingerprint: PolicyFingerprint,
+) -> Result<DeliverySnapshot, Error> {
+    let conn = transaction.connection();
+    let snapshot = require_immediate_context(
+        conn,
+        tables,
+        account_id,
+        submission_context,
+        expected_revision,
+        run_identity,
+        Some(artifact_identity),
+        Some(expected_policy_fingerprint),
+    )?;
+    require_immediate_forward_exposure_context(conn, tables, &snapshot)?;
+    if snapshot.phase() != DeliveryPhase::Active {
+        return Err(Error::DeliveryPhaseMismatch);
+    }
+    let claim = snapshot
+        .claims()
+        .first()
+        .ok_or(Error::DeliveryClaimUnavailable)?;
+    if claim.signer_ownership() != signer_ownership
+        || claim.status() != ClaimStatus::MaterializationFailed
+        || claim.lease().is_some()
+        || claim.has_exposure_history()
+        || claim.external_signing_pczt().is_some()
+        || claim.signed_pczt().is_some()
+        || claim.exact_transaction().is_some()
+        || claim.txid().is_some()
+        || !matches!(
+            claim.last_error(),
+            Some(
+                DeliveryFailureReason::MaterializationFailed
+                    | DeliveryFailureReason::MaterializationLeaseExpired
+                    | DeliveryFailureReason::SigningCancelled
+            )
+        )
+    {
+        return Err(Error::DeliveryClaimUnavailable);
+    }
+    let DeliveryArtifactEvidence::Immediate(evidence) = claim.evidence() else {
+        return Err(Error::DeliveryArtifactMismatch);
+    };
+    let (_, proposal_gross_amount) = immediate_proposal_authority(evidence.canonical_proposal())?;
+    require_immediate_gross_authorization(proposal_gross_amount, maximum_gross_amount)?;
+    let legacy_authorization = snapshot.immediate_maximum_gross_amount().is_none();
+    let stored_maximum_gross_amount = i64::try_from(maximum_gross_amount.into_u64())
+        .map_err(|_| Error::Corrupt("immediate gross authorization"))?;
+
+    let lease = checked_delivery_lease(ClaimKind::Materialization, lease_duration)?;
+    let signer = match signer_ownership {
+        SignerOwnership::Sdk => "sdk",
+        SignerOwnership::External => "external",
+    };
+    if legacy_authorization {
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (run_identity, authorization_version, maximum_gross_amount)
+                 VALUES (?, ?, ?)",
+                tables.immediate_gross_authorization
+            ),
+            params![
+                run_identity.as_bytes(),
+                IMMEDIATE_GROSS_AUTHORIZATION_VERSION,
+                stored_maximum_gross_amount,
+            ],
+        )?;
+    }
+    let changed = conn.execute(
+        &format!(
+            "UPDATE {} SET status = 'materializing', claim_kind = 'materialization',
+             attempt_token = ?, lease_clock_session = ?, lease_acquired_at_ms = ?,
+             lease_expires_at_ms = ?, last_error = NULL
+             WHERE run_identity = ? AND revision = ? AND phase = 'active'
+               AND status = 'materialization_failed' AND signer_ownership = ?
+               AND claim_kind IS NULL AND attempt_token IS NULL
+               AND lease_clock_session IS NULL AND lease_acquired_at_ms IS NULL
+               AND lease_expires_at_ms IS NULL AND unsigned_pczt_digest IS NULL
+               AND canonical_unsigned_pczt IS NULL AND signed_pczt_digest IS NULL
+               AND canonical_signed_pczt IS NULL AND signed_pczt_binding IS NULL
+               AND txid IS NULL AND exact_tx IS NULL AND exact_tx_digest IS NULL",
+            tables.immediate_delivery
+        ),
+        params![
+            lease.token().as_bytes(),
+            lease.acquired_at().session().as_bytes(),
+            lease.acquired_at().tick_millis(),
+            lease.expires_at().tick_millis(),
+            run_identity.as_bytes(),
+            expected_revision.as_u64(),
+            signer,
+        ],
+    )?;
+    require_immediate_cas_update(changed)?;
+    bump_immediate_revision(conn, tables, run_identity)?;
+    immediate_snapshot_after_mutation(conn, tables, account_id, run_identity, submission_context)
 }
 
 #[cfg(feature = "migration-delivery")]
@@ -8842,6 +9582,7 @@ pub(super) fn reacquire_immediate_external_signing(
         Some(artifact_identity),
         Some(expected_policy_fingerprint),
     )?;
+    require_immediate_spend_authorization(conn, tables, &snapshot)?;
     if snapshot.phase() != DeliveryPhase::Active {
         return Err(Error::DeliveryPhaseMismatch);
     }
@@ -8910,6 +9651,7 @@ pub(super) fn stage_immediate_external_signing_pczt(
         Some(artifact_identity),
         Some(expected_policy_fingerprint),
     )?;
+    require_immediate_spend_authorization(conn, tables, &snapshot)?;
     let claim = snapshot
         .claims()
         .first()
@@ -8971,6 +9713,7 @@ pub(super) fn stage_immediate_signed_pczt(
         Some(artifact_identity),
         Some(expected_policy_fingerprint),
     )?;
+    require_immediate_spend_authorization(conn, tables, &snapshot)?;
     let claim = snapshot
         .claims()
         .first()
@@ -9037,6 +9780,7 @@ pub(super) fn stage_immediate_transaction(
         Some(artifact_identity),
         Some(expected_policy_fingerprint),
     )?;
+    require_immediate_spend_authorization(conn, tables, &snapshot)?;
     let claim = snapshot
         .claims()
         .first()
@@ -9108,6 +9852,9 @@ pub(super) fn claim_immediate(
         Some(artifact_identity),
         Some(expected_policy_fingerprint),
     )?;
+    if kind == ClaimKind::Submission {
+        require_immediate_spend_authorization(conn, tables, &snapshot)?;
+    }
     if snapshot.phase() != DeliveryPhase::Active {
         return Err(Error::DeliveryPhaseMismatch);
     }
@@ -9191,6 +9938,12 @@ pub(super) fn resume_immediate_claim(
         .claims()
         .first()
         .ok_or(Error::DeliveryClaimUnavailable)?;
+    if matches!(
+        claim.claim_kind(),
+        Some(ClaimKind::Materialization | ClaimKind::Submission)
+    ) {
+        require_immediate_spend_authorization(conn, tables, &snapshot)?;
+    }
     if snapshot.phase() != DeliveryPhase::Active || claim.token() != Some(token) {
         return Ok(None);
     }
@@ -9232,6 +9985,12 @@ pub(super) fn renew_immediate_claim(
         .claims()
         .first()
         .ok_or(Error::DeliveryClaimUnavailable)?;
+    if matches!(
+        claim.claim_kind(),
+        Some(ClaimKind::Materialization | ClaimKind::Submission)
+    ) {
+        require_immediate_spend_authorization(conn, tables, &snapshot)?;
+    }
     let Some(existing) = claim.lease() else {
         return Ok(None);
     };
@@ -9645,7 +10404,9 @@ pub(super) fn finish_immediate_abandonment(
 /// consulting mutable wallet note state. This is used by schema-provenance checks, where a missing
 /// or already-spent note must not make malformed durable authority look coherent.
 #[cfg(feature = "migration-delivery")]
-fn immediate_proposal_sources(canonical_proposal: &[u8]) -> Result<BTreeSet<OutputRef>, Error> {
+fn immediate_proposal_authority(
+    canonical_proposal: &[u8],
+) -> Result<(BTreeSet<OutputRef>, Zatoshis), Error> {
     use zcash_client_backend::proto::proposal::{self, proposed_input};
 
     let envelope = ImmediateProposal::decode(canonical_proposal)
@@ -9656,6 +10417,7 @@ fn immediate_proposal_sources(canonical_proposal: &[u8]) -> Result<BTreeSet<Outp
         return Err(Error::Corrupt("immediate proposal step count"));
     }
     let mut sources = BTreeSet::new();
+    let mut gross_amount = Zatoshis::ZERO;
     for input in &proposal.steps[0].inputs {
         let proposed_input::Value::ReceivedOutput(output) = input
             .value
@@ -9669,6 +10431,13 @@ fn immediate_proposal_sources(canonical_proposal: &[u8]) -> Result<BTreeSet<Outp
         {
             return Err(Error::Corrupt("immediate proposal source pool"));
         }
+        let value = Zatoshis::from_u64(output.value)
+            .map_err(|_| Error::Corrupt("immediate proposal source value"))?;
+        if !value.is_positive() {
+            return Err(Error::Corrupt("immediate proposal source value"));
+        }
+        gross_amount = (gross_amount + value)
+            .ok_or(Error::Corrupt("immediate proposal gross input amount"))?;
         let txid = <[u8; 32]>::try_from(output.txid.as_slice())
             .map(TxId::from_bytes)
             .map_err(|_| Error::Corrupt("immediate proposal source txid"))?;
@@ -9684,7 +10453,19 @@ fn immediate_proposal_sources(canonical_proposal: &[u8]) -> Result<BTreeSet<Outp
     if sources.is_empty() {
         return Err(Error::Corrupt("empty immediate proposal source set"));
     }
-    Ok(sources)
+    Ok((sources, gross_amount))
+}
+
+#[cfg(feature = "migration-delivery")]
+fn require_immediate_gross_authorization(
+    proposal_gross_amount: Zatoshis,
+    maximum_gross_amount: Zatoshis,
+) -> Result<(), Error> {
+    if proposal_gross_amount <= maximum_gross_amount {
+        Ok(())
+    } else {
+        Err(Error::ImmediateAmountLimitExceeded)
+    }
 }
 
 /// Proves that one immediate run's canonical proposal, source reservations, account ownership,
@@ -9728,7 +10509,7 @@ pub(super) fn immediate_reservations_are_complete(
     let lock_owner = lock_owner
         .map(LockOwner::new)
         .ok_or(Error::Corrupt("immediate canonical wallet lock owner"))?;
-    let proposal_sources = immediate_proposal_sources(&canonical_proposal)?;
+    let (proposal_sources, _) = immediate_proposal_authority(&canonical_proposal)?;
 
     let reserved_sources = {
         let mut stmt = conn.prepare(&format!(
@@ -11495,4 +12276,171 @@ fn insert_zatoshi_list(
         )?;
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "migration-delivery"))]
+mod tests {
+    use super::*;
+    use zcash_client_backend::proto::proposal::{self, proposed_input};
+    use zcash_pool_migration::delivery::{ImmediateProposalPayload, SignerOwnership};
+    use zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA;
+    use zcash_protocol::consensus::BranchId;
+
+    /// Stable target at which the test proposal uses the NU6.3 branch.
+    const TEST_TARGET_HEIGHT: u32 = 2_000;
+    /// Byte width of a canonical transaction identifier.
+    const TEST_TXID_LENGTH: usize = 32;
+    /// First nonzero byte used to distinguish synthetic proposal sources.
+    const TEST_TXID_BASE_BYTE: u8 = 1;
+    /// Opaque account identifier used to prove intent preservation.
+    const TEST_ACCOUNT_ID: u32 = 7;
+    /// User-confirmed ceiling used to prove the intent accessor is lossless.
+    const TEST_INTENT_CEILING: u64 = 12_345;
+    /// First exact Orchard input value in the multi-input proposal.
+    const TEST_FIRST_INPUT_VALUE: u64 = 7;
+    /// Second exact Orchard input value in the multi-input proposal.
+    const TEST_SECOND_INPUT_VALUE: u64 = 11;
+    /// Sum of the two exact Orchard input values above.
+    const TEST_EXPECTED_GROSS_AMOUNT: u64 = TEST_FIRST_INPUT_VALUE + TEST_SECOND_INPUT_VALUE;
+    /// Smallest positive value used to force a bounded-value overflow.
+    const TEST_ONE_ZATOSHI: u64 = 1;
+
+    fn immediate_proposal_with_inputs(values: &[u64]) -> Vec<u8> {
+        let inputs = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| proposal::ProposedInput {
+                value: Some(proposed_input::Value::ReceivedOutput(
+                    proposal::ReceivedOutput {
+                        txid: vec![
+                            u8::try_from(index)
+                                .unwrap()
+                                .checked_add(TEST_TXID_BASE_BYTE)
+                                .unwrap();
+                            TEST_TXID_LENGTH
+                        ],
+                        value_pool: proposal::ValuePool::Orchard.into(),
+                        index: u32::try_from(index).unwrap(),
+                        value: *value,
+                    },
+                )),
+            })
+            .collect();
+        let payload = proposal::Proposal {
+            steps: vec![proposal::ProposalStep {
+                inputs,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let target = BlockHeight::from_u32(TEST_TARGET_HEIGHT);
+        let envelope = ImmediateProposal::new(
+            target,
+            BlockHeight::from_u32(TEST_TARGET_HEIGHT + DEFAULT_TX_EXPIRY_DELTA),
+            BranchId::Nu6_3,
+            ImmediateProposalPayload::try_from(payload).unwrap(),
+        )
+        .unwrap();
+        let mut canonical = Vec::new();
+        envelope.write(&mut canonical).unwrap();
+        canonical
+    }
+
+    #[test]
+    fn historical_delivery_v1_schema_fingerprint_is_frozen() {
+        let normalized = normalized_schema_sql(&delivery_control_schema_v1_sql(
+            &crate::pool_migration::orchard_ironwood::TABLES,
+        ));
+        let fingerprint = LegacySchemaFingerprint::from_schema_sql(normalized.as_bytes());
+        assert_eq!(
+            hex::encode(fingerprint.as_bytes()),
+            "b34a91a47c83acb9a3eb9d588cbc50ac8d6373a0fd77c1f5f051c7e6a2f61220",
+            "migration d14c3f72 must continue to emit the exact normalized schema published by 98b51b18",
+        );
+    }
+
+    #[test]
+    fn delivery_v2_schema_limits_match_current_domain_limits() {
+        assert_eq!(
+            DELIVERY_SCHEMA_V2_GROSS_AUTHORIZATION_VERSION,
+            IMMEDIATE_GROSS_AUTHORIZATION_VERSION,
+        );
+        assert_eq!(
+            DELIVERY_SCHEMA_V2_MAX_MONEY,
+            zcash_protocol::value::MAX_MONEY
+        );
+        assert_eq!(
+            DELIVERY_SCHEMA_V2_MAX_IMMEDIATE_PROPOSAL_ENVELOPE,
+            zcash_pool_migration::delivery::MAX_IMMEDIATE_PROPOSAL_ENVELOPE_BYTES,
+        );
+        assert_eq!(
+            DELIVERY_SCHEMA_V2_MAX_EXACT_TRANSACTION,
+            zcash_pool_migration::delivery::MAX_EXACT_TRANSACTION_BYTES,
+        );
+        assert_eq!(
+            DELIVERY_SCHEMA_V2_MAX_FINALITY_ARCHIVE,
+            zcash_pool_migration::delivery::MAX_FINALITY_ARCHIVE_BYTES,
+        );
+    }
+
+    #[test]
+    fn immediate_intent_preserves_the_user_confirmed_gross_ceiling() {
+        let maximum = Zatoshis::from_u64(TEST_INTENT_CEILING).unwrap();
+        let intent = zcash_pool_migration::delivery::ImmediateMigrationIntent::new(
+            TEST_ACCOUNT_ID,
+            SignerOwnership::External,
+            maximum,
+        );
+        assert_eq!(intent.account_id(), &TEST_ACCOUNT_ID);
+        assert_eq!(intent.signer_ownership(), SignerOwnership::External);
+        assert_eq!(intent.maximum_gross_amount(), maximum);
+    }
+
+    #[test]
+    fn immediate_proposal_authority_derives_exact_gross_input_value() {
+        let input_values = [TEST_FIRST_INPUT_VALUE, TEST_SECOND_INPUT_VALUE];
+        let canonical = immediate_proposal_with_inputs(&input_values);
+        let (sources, gross) = immediate_proposal_authority(&canonical).unwrap();
+        assert_eq!(sources.len(), input_values.len());
+        assert_eq!(
+            gross,
+            Zatoshis::from_u64(TEST_EXPECTED_GROSS_AMOUNT).unwrap()
+        );
+    }
+
+    #[test]
+    fn immediate_gross_authorization_accepts_at_or_below_and_rejects_above() {
+        let maximum = Zatoshis::from_u64(TEST_EXPECTED_GROSS_AMOUNT).unwrap();
+        assert!(
+            require_immediate_gross_authorization(
+                Zatoshis::from_u64(TEST_EXPECTED_GROSS_AMOUNT - TEST_ONE_ZATOSHI).unwrap(),
+                maximum
+            )
+            .is_ok()
+        );
+        assert!(require_immediate_gross_authorization(maximum, maximum).is_ok());
+        assert!(matches!(
+            require_immediate_gross_authorization(
+                Zatoshis::from_u64(TEST_EXPECTED_GROSS_AMOUNT + TEST_ONE_ZATOSHI).unwrap(),
+                maximum
+            ),
+            Err(Error::ImmediateAmountLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn immediate_proposal_authority_rejects_zero_and_overflowing_inputs() {
+        assert!(matches!(
+            immediate_proposal_authority(&immediate_proposal_with_inputs(&[0])),
+            Err(Error::Corrupt("immediate proposal source value"))
+        ));
+        assert!(matches!(
+            immediate_proposal_authority(&immediate_proposal_with_inputs(&[
+                zcash_protocol::value::MAX_MONEY,
+                TEST_ONE_ZATOSHI,
+            ])),
+            Err(Error::Corrupt("immediate proposal gross input amount"))
+        ));
+    }
 }

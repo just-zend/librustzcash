@@ -68,6 +68,8 @@ const NETWORK_REGTEST_TAG: u8 = 2;
 const TRANSPORT_DIRECT_TLS_TAG: u8 = 0;
 const TRANSPORT_TOR_ONION_TAG: u8 = 1;
 const TRANSPORT_LOOPBACK_DEVELOPMENT_TAG: u8 = 2;
+/// Stable canonical-policy tag for a public TLS endpoint reached through Tor.
+const TRANSPORT_TOR_PROXY_TLS_TAG: u8 = 3;
 const TRANSACTION_KIND_PREPARATION_TAG: u8 = 0;
 const TRANSACTION_KIND_TRANSFER_TAG: u8 = 1;
 const ARTIFACT_SCHEDULED_TAG: u8 = 0;
@@ -1355,6 +1357,7 @@ impl fmt::Debug for SubmissionContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EndpointClass {
     DirectTls,
+    TorProxyTls,
     TorOnion,
     LoopbackDevelopment,
 }
@@ -1373,7 +1376,7 @@ pub enum EndpointValidationError {
     UnsupportedUrlComponent,
     /// The host or optional port is malformed.
     InvalidAuthority,
-    /// A direct endpoint points at loopback or an onion service.
+    /// A public TLS endpoint is not a canonical public DNS name.
     DirectEndpointNotPublic,
     /// A Tor endpoint is not a canonical v3 onion service name.
     InvalidOnionService,
@@ -1391,7 +1394,9 @@ impl fmt::Display for EndpointValidationError {
                 "submission endpoint contains an unsupported URL component"
             }
             Self::InvalidAuthority => "submission endpoint authority is invalid",
-            Self::DirectEndpointNotPublic => "direct TLS endpoint must not be loopback or onion",
+            Self::DirectEndpointNotPublic => {
+                "public TLS endpoint must use a canonical public DNS name"
+            }
             Self::InvalidOnionService => "Tor endpoint must use a canonical v3 onion service",
             Self::InvalidLoopbackHost => "development endpoint must use an explicit loopback host",
         })
@@ -1416,6 +1421,32 @@ fn validate_hostname(host: &str) -> bool {
         }
     }
     true
+}
+
+/// Accepts a canonical DNS name and rejects every literal or legacy numeric-IP spelling.
+///
+/// This is deliberately DNS-only. Classifying IP address ranges without DNS or routing context is
+/// not a stable authorization boundary, and URL/network stacks have historically accepted
+/// noncanonical one- to four-component numeric spellings in addition to dotted-decimal IPv4.
+fn validate_public_dns_hostname(host: &str) -> bool {
+    if !validate_hostname(host)
+        || host == "localhost"
+        || host.ends_with(ONION_SUFFIX)
+        || !host.contains('.')
+    {
+        return false;
+    }
+
+    let final_label_has_letter = host
+        .rsplit_once('.')
+        .is_some_and(|(_, label)| label.bytes().any(|byte| byte.is_ascii_lowercase()));
+    let is_numeric_address_spelling = host.split('.').all(|label| {
+        label.bytes().all(|byte| byte.is_ascii_digit())
+            || label.strip_prefix("0x").is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    });
+    final_label_has_letter && !is_numeric_address_spelling
 }
 
 fn validate_port(port: &str) -> bool {
@@ -1454,18 +1485,19 @@ fn validate_endpoint(value: &str, class: EndpointClass) -> Result<(), EndpointVa
         return Err(EndpointValidationError::InvalidCharacters);
     }
 
-    let remainder = match class {
-        EndpointClass::DirectTls => value
-            .strip_prefix(HTTPS_SCHEME)
-            .ok_or(EndpointValidationError::InvalidScheme)?,
-        EndpointClass::TorOnion => value
-            .strip_prefix(HTTP_SCHEME)
-            .or_else(|| value.strip_prefix(HTTPS_SCHEME))
-            .ok_or(EndpointValidationError::InvalidScheme)?,
-        EndpointClass::LoopbackDevelopment => value
-            .strip_prefix(HTTP_SCHEME)
-            .ok_or(EndpointValidationError::InvalidScheme)?,
-    };
+    let remainder =
+        match class {
+            EndpointClass::DirectTls | EndpointClass::TorProxyTls => value
+                .strip_prefix(HTTPS_SCHEME)
+                .ok_or(EndpointValidationError::InvalidScheme)?,
+            EndpointClass::TorOnion => value
+                .strip_prefix(HTTP_SCHEME)
+                .or_else(|| value.strip_prefix(HTTPS_SCHEME))
+                .ok_or(EndpointValidationError::InvalidScheme)?,
+            EndpointClass::LoopbackDevelopment => value
+                .strip_prefix(HTTP_SCHEME)
+                .ok_or(EndpointValidationError::InvalidScheme)?,
+        };
     if remainder.contains('@') || remainder.contains('?') || remainder.contains('#') {
         return Err(EndpointValidationError::UnsupportedUrlComponent);
     }
@@ -1481,13 +1513,8 @@ fn validate_endpoint(value: &str, class: EndpointClass) -> Result<(), EndpointVa
     }
 
     match class {
-        EndpointClass::DirectTls => {
-            if !validate_hostname(host)
-                || host == "localhost"
-                || host.ends_with(ONION_SUFFIX)
-                || host.starts_with("127.")
-                || host == "[::1]"
-            {
+        EndpointClass::DirectTls | EndpointClass::TorProxyTls => {
+            if !validate_public_dns_hostname(host) {
                 return Err(EndpointValidationError::DirectEndpointNotPublic);
             }
         }
@@ -1544,10 +1571,16 @@ macro_rules! endpoint_type {
 }
 
 endpoint_type!(
-    /// A public endpoint that requires direct TLS transport.
+    /// A public DNS endpoint that requires direct TLS transport.
     DirectTlsEndpoint,
     EndpointClass::DirectTls,
     "DirectTlsEndpoint"
+);
+endpoint_type!(
+    /// A public DNS TLS endpoint reached through an isolated Tor proxy.
+    TorProxyTlsEndpoint,
+    EndpointClass::TorProxyTls,
+    "TorProxyTlsEndpoint"
 );
 endpoint_type!(
     /// A canonical v3 onion endpoint reached through Tor.
@@ -1565,8 +1598,10 @@ endpoint_type!(
 /// Rust-validated transport and endpoint for transaction submission.
 #[derive(Clone, PartialEq, Eq)]
 pub enum SubmissionTransport {
-    /// Direct transport to a public TLS endpoint.
+    /// Direct transport to a public DNS TLS endpoint.
     DirectTls(DirectTlsEndpoint),
+    /// Tor-proxied transport to a public DNS TLS endpoint.
+    TorProxyTls(TorProxyTlsEndpoint),
     /// Tor transport to a v3 onion service.
     TorOnion(TorOnionEndpoint),
     /// Explicitly insecure loopback transport for development only.
@@ -1577,6 +1612,7 @@ impl SubmissionTransport {
     fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
         let (tag, endpoint) = match self {
             Self::DirectTls(endpoint) => (TRANSPORT_DIRECT_TLS_TAG, endpoint.as_str()),
+            Self::TorProxyTls(endpoint) => (TRANSPORT_TOR_PROXY_TLS_TAG, endpoint.as_str()),
             Self::TorOnion(endpoint) => (TRANSPORT_TOR_ONION_TAG, endpoint.as_str()),
             Self::LoopbackDevelopment(endpoint) => {
                 (TRANSPORT_LOOPBACK_DEVELOPMENT_TAG, endpoint.as_str())
@@ -1605,6 +1641,9 @@ impl SubmissionTransport {
             TRANSPORT_DIRECT_TLS_TAG => DirectTlsEndpoint::try_from(endpoint)
                 .map(Self::DirectTls)
                 .map_err(invalid),
+            TRANSPORT_TOR_PROXY_TLS_TAG => TorProxyTlsEndpoint::try_from(endpoint)
+                .map(Self::TorProxyTls)
+                .map_err(invalid),
             TRANSPORT_TOR_ONION_TAG => TorOnionEndpoint::try_from(endpoint)
                 .map(Self::TorOnion)
                 .map_err(invalid),
@@ -1622,6 +1661,7 @@ impl SubmissionTransport {
     pub fn endpoint(&self) -> &str {
         match self {
             Self::DirectTls(endpoint) => endpoint.as_str(),
+            Self::TorProxyTls(endpoint) => endpoint.as_str(),
             Self::TorOnion(endpoint) => endpoint.as_str(),
             Self::LoopbackDevelopment(endpoint) => endpoint.as_str(),
         }
@@ -1632,6 +1672,7 @@ impl fmt::Debug for SubmissionTransport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::DirectTls(_) => "SubmissionTransport::DirectTls(<redacted>)",
+            Self::TorProxyTls(_) => "SubmissionTransport::TorProxyTls(<redacted>)",
             Self::TorOnion(_) => "SubmissionTransport::TorOnion(<redacted>)",
             Self::LoopbackDevelopment(_) => "SubmissionTransport::LoopbackDevelopment(<redacted>)",
         })
@@ -1982,23 +2023,32 @@ pub enum SignerOwnership {
     External,
 }
 
-/// Account-scoped intent to migrate every currently eligible Orchard source immediately.
+/// Account-scoped intent to migrate currently eligible Orchard sources immediately, bounded by
+/// the user's confirmed gross-amount authorization.
 ///
-/// The intent deliberately carries no caller-selected sources, amount, destination, dependency
-/// graph, target height, proposal bytes, or expiry. The implementing wallet store derives all of
-/// those values from one revision-consistent wallet view and reserves the exact derived sources
-/// before returning any proposal representation.
+/// The intent deliberately carries no caller-selected sources, destination, dependency graph,
+/// target height, proposal bytes, or expiry. Its amount is only an upper bound: the implementing
+/// wallet store derives the exact gross input amount and every other proposal value from one
+/// revision-consistent wallet view, rejects a proposal above the bound, and reserves the exact
+/// derived sources before returning any proposal representation.
 pub struct ImmediateMigrationIntent<AccountId> {
     account_id: AccountId,
     signer_ownership: SignerOwnership,
+    maximum_gross_amount: Zatoshis,
 }
 
 impl<AccountId> ImmediateMigrationIntent<AccountId> {
-    /// Selects an account and authorization owner without accepting caller-authored proposal data.
-    pub const fn new(account_id: AccountId, signer_ownership: SignerOwnership) -> Self {
+    /// Selects an account, authorization owner, and user-confirmed gross-amount ceiling without
+    /// accepting caller-authored proposal data.
+    pub const fn new(
+        account_id: AccountId,
+        signer_ownership: SignerOwnership,
+        maximum_gross_amount: Zatoshis,
+    ) -> Self {
         Self {
             account_id,
             signer_ownership,
+            maximum_gross_amount,
         }
     }
 
@@ -2011,6 +2061,11 @@ impl<AccountId> ImmediateMigrationIntent<AccountId> {
     pub const fn signer_ownership(&self) -> SignerOwnership {
         self.signer_ownership
     }
+
+    /// Returns the maximum total value of Orchard sources that this intent authorizes.
+    pub const fn maximum_gross_amount(&self) -> Zatoshis {
+        self.maximum_gross_amount
+    }
 }
 
 impl<AccountId: fmt::Debug> fmt::Debug for ImmediateMigrationIntent<AccountId> {
@@ -2018,6 +2073,7 @@ impl<AccountId: fmt::Debug> fmt::Debug for ImmediateMigrationIntent<AccountId> {
         f.debug_struct("ImmediateMigrationIntent")
             .field("account_id", &self.account_id)
             .field("signer_ownership", &self.signer_ownership)
+            .field("maximum_gross_amount", &self.maximum_gross_amount)
             .finish()
     }
 }
@@ -3734,6 +3790,10 @@ pub enum RuntimeUnavailableReason {
     SubmissionPolicyMismatch,
     /// Canonical and delivery fingerprints or exact evidence disagree.
     DeliveryInconsistent,
+    /// A live immediate run in a pre-chain, forward-exposure-capable state predates durable
+    /// persistence of the user's maximum authorized gross spend. Read-only state and non-exposing
+    /// recovery remain available, but no new exposure capability may be issued.
+    MissingSpendAuthorization,
     /// A rewind or missing active-chain evidence requires finality recovery.
     FinalityRecovery(StorageRecoveryReason),
 }
@@ -4744,6 +4804,8 @@ pub enum SnapshotValidationError {
     ClaimPolicyMismatch,
     /// A claim belongs to a different delivery lane than its run.
     ClaimLaneMismatch,
+    /// Scheduled delivery cannot carry immediate-only gross-amount authorization.
+    UnexpectedImmediateGrossAuthorization,
     /// Finalized exposed storage omitted immutable release evidence needed for future rewind audits.
     MissingFinalityArchive,
     /// Finality evidence was attached before reservation release or without a retained run.
@@ -4790,16 +4852,44 @@ pub struct DeliverySnapshot {
     finality_archive: Option<FinalityArchive>,
     submission_policy: Option<SubmissionPolicy>,
     policy_validation_failure: Option<PolicyValidationFailure>,
+    /// The user-confirmed ceiling persisted with an immediate run. `None` is valid only as
+    /// fail-closed evidence for an immediate row created before gross authorization was required,
+    /// or for the scheduled lane where this authority does not apply.
+    immediate_maximum_gross_amount: Option<Zatoshis>,
     claims: Vec<DeliveryClaim>,
 }
 
 impl DeliverySnapshot {
+    fn has_resolved_unmined_exposure(phase: DeliveryPhase, claims: &[DeliveryClaim]) -> bool {
+        if phase != DeliveryPhase::Abandoned {
+            return false;
+        }
+        let mut found_exposure = false;
+        for claim in claims {
+            if claim.lease().is_some() {
+                return false;
+            }
+            if claim.has_exposure_history() {
+                if !matches!(
+                    claim.status(),
+                    ClaimStatus::ExpiredUnmined | ClaimStatus::ExternalSigningExpiredUnmined
+                ) {
+                    return false;
+                }
+                found_exposure = true;
+            }
+        }
+        found_exposure
+    }
+
     fn resolved_unmined_release_from_claims(
         phase: DeliveryPhase,
         active_source_reservation_count: u64,
         claims: &[DeliveryClaim],
     ) -> Option<ReservationRelease> {
-        if phase != DeliveryPhase::Abandoned || active_source_reservation_count != 0 {
+        if active_source_reservation_count != 0
+            || !Self::has_resolved_unmined_exposure(phase, claims)
+        {
             return None;
         }
         let mut max_exposed_expiry = None;
@@ -4851,8 +4941,49 @@ impl DeliverySnapshot {
         policy_validation_failure: Option<PolicyValidationFailure>,
         claims: Vec<DeliveryClaim>,
     ) -> Result<Self, SnapshotValidationError> {
+        Self::from_parts_with_immediate_gross_authorization(
+            revision,
+            run_identity,
+            run_fingerprint,
+            source_reservation_owner,
+            phase,
+            storage_finality,
+            active_source_reservation_count,
+            finality_archive,
+            submission_policy,
+            policy_validation_failure,
+            None,
+            claims,
+        )
+    }
+
+    /// Reconstructs a snapshot carrying durable immediate gross-amount authorization.
+    ///
+    /// Stores use this constructor only after reading the versioned authorization record in the
+    /// same atomic view as the immediate proposal. A missing authorization remains representable so
+    /// an older row can be projected as unavailable without fabricating user consent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts_with_immediate_gross_authorization(
+        revision: DeliveryRevision,
+        run_identity: MigrationRunIdentity,
+        run_fingerprint: DeliveryRunFingerprint,
+        source_reservation_owner: SourceReservationOwner,
+        phase: DeliveryPhase,
+        storage_finality: StorageFinality,
+        active_source_reservation_count: u64,
+        finality_archive: Option<FinalityArchive>,
+        submission_policy: Option<SubmissionPolicy>,
+        policy_validation_failure: Option<PolicyValidationFailure>,
+        immediate_maximum_gross_amount: Option<Zatoshis>,
+        claims: Vec<DeliveryClaim>,
+    ) -> Result<Self, SnapshotValidationError> {
         if submission_policy.is_some() && policy_validation_failure.is_some() {
             return Err(SnapshotValidationError::ConflictingPolicyState);
+        }
+        if run_fingerprint.lane() == DeliveryLane::Scheduled
+            && immediate_maximum_gross_amount.is_some()
+        {
+            return Err(SnapshotValidationError::UnexpectedImmediateGrossAuthorization);
         }
         if let Some(policy) = submission_policy.as_ref()
             && claims
@@ -4882,13 +5013,9 @@ impl DeliverySnapshot {
         let recovering_after_resolved_unmined_exposure = matches!(
             storage_finality,
             StorageFinality::RecoveryRequired(StorageRecoveryReason::RewoundBeyondFinalityHorizon)
-        )
-            && Self::resolved_unmined_release_from_claims(
-                phase,
-                active_source_reservation_count,
-                &claims,
-            )
-            .is_some();
+        ) && Self::has_resolved_unmined_exposure(
+            phase, &claims,
+        );
         match storage_finality {
             StorageFinality::NoRun => {
                 return Err(SnapshotValidationError::RunWithoutStorageFinality);
@@ -4950,6 +5077,7 @@ impl DeliverySnapshot {
             finality_archive,
             submission_policy,
             policy_validation_failure,
+            immediate_maximum_gross_amount,
             claims,
         })
     }
@@ -5017,6 +5145,14 @@ impl DeliverySnapshot {
         self.policy_validation_failure
     }
 
+    /// Returns the durable user-confirmed gross ceiling for an immediate run.
+    ///
+    /// `None` on an immediate snapshot means the row predates this authority boundary and the
+    /// enclosing runtime must remain unavailable. Scheduled runs always return `None`.
+    pub const fn immediate_maximum_gross_amount(&self) -> Option<Zatoshis> {
+        self.immediate_maximum_gross_amount
+    }
+
     /// Returns exact delivery claims.
     pub fn claims(&self) -> &[DeliveryClaim] {
         &self.claims
@@ -5079,6 +5215,10 @@ impl fmt::Debug for DeliverySnapshot {
             )
             .field("submission_policy", &self.submission_policy)
             .field("policy_validation_failure", &self.policy_validation_failure)
+            .field(
+                "immediate_gross_authorization",
+                &self.immediate_maximum_gross_amount.map(|_| "<redacted>"),
+            )
             .field("claims", &self.claims)
             .field("safe_to_cancel", &self.safe_to_cancel())
             .finish()
@@ -5436,6 +5576,33 @@ impl MigrationRuntimeSnapshot {
         if let StorageFinality::RecoveryRequired(reason) = snapshot.storage_finality() {
             return MigrationRuntimeAvailability::Unavailable(
                 RuntimeUnavailableReason::FinalityRecovery(reason),
+            );
+        }
+        if snapshot.lane() == DeliveryLane::Immediate
+            && snapshot.claims().is_empty()
+            && !matches!(
+                snapshot.phase(),
+                DeliveryPhase::Abandoning | DeliveryPhase::Abandoned
+            )
+        {
+            return MigrationRuntimeAvailability::Unavailable(
+                RuntimeUnavailableReason::DeliveryInconsistent,
+            );
+        }
+        if snapshot.lane() == DeliveryLane::Immediate
+            && snapshot.immediate_maximum_gross_amount().is_none()
+            && snapshot.claims().first().is_some_and(|claim| {
+                matches!(
+                    claim.status(),
+                    ClaimStatus::Materializing
+                        | ClaimStatus::MaterializationFailed
+                        | ClaimStatus::AwaitingExternalSignature
+                        | ClaimStatus::Staged
+                )
+            })
+        {
+            return MigrationRuntimeAvailability::Unavailable(
+                RuntimeUnavailableReason::MissingSpendAuthorization,
             );
         }
         if snapshot.submission_policy().is_none()
@@ -5873,10 +6040,13 @@ pub trait ImmediateMigrationDeliveryStore {
     ///
     /// The store must derive a one-step send-max proposal from currently eligible Orchard sources,
     /// the account's own Ironwood receiver, its current target height, no prior-step dependencies,
-    /// and the transaction builder's expiry. It must revalidate those invariants and apply every
-    /// source reservation and delivery write or none of them. Proposal evidence must not be exposed
-    /// before commit; after an error no immediate run or source reservation may persist. The store
-    /// samples its own monotonic clock; no caller-authored `now` value participates in authority.
+    /// and the transaction builder's expiry. Within that same atomic wallet view it must derive the
+    /// proposal's gross Orchard input value and reject it when it exceeds
+    /// [`ImmediateMigrationIntent::maximum_gross_amount`]. It must revalidate those invariants and
+    /// apply every source reservation and delivery write or none of them. Proposal evidence must
+    /// not be exposed before commit; after an error no immediate run or source reservation may
+    /// persist. The store samples its own monotonic clock; no caller-authored `now` value
+    /// participates in authority.
     fn reserve_immediate_delivery(
         &mut self,
         intent: ImmediateMigrationIntent<Self::AccountId>,
@@ -5897,6 +6067,31 @@ pub trait ImmediateMigrationDeliveryStore {
         &mut self,
         account_id: &Self::AccountId,
     ) -> Result<MigrationRuntimeSnapshot, Self::Error>;
+
+    /// Atomically reacquires bounded materialization authority for the same unexposed immediate
+    /// artifact after a known-unsent materialization failure.
+    ///
+    /// The store must require the exact account, run, artifact, signer, and policy; an active run;
+    /// [`ClaimStatus::MaterializationFailed`] with no lease; and no external-signing, signed-PCZT,
+    /// exact-transaction, transaction-id, or chain-exposure history. It must re-derive the gross
+    /// Orchard input amount from the persisted canonical proposal and reject reacquisition when it
+    /// exceeds `maximum_gross_amount`. It generates a fresh token while preserving proposal
+    /// evidence, source reservations, and every stable identity. It must never derive or reserve a
+    /// replacement proposal. When the legacy row did not already carry durable gross-spend
+    /// authorization, persisting that authorization, changing the claim, and advancing the
+    /// revision are one all-or-none transaction: any error must leave all three unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn reacquire_failed_immediate_materialization(
+        &mut self,
+        account_id: &Self::AccountId,
+        expected_revision: DeliveryRevision,
+        run_identity: MigrationRunIdentity,
+        artifact_identity: ImmediateArtifactIdentity,
+        signer_ownership: SignerOwnership,
+        maximum_gross_amount: Zatoshis,
+        lease_duration: LeaseDuration,
+        expected_policy_fingerprint: PolicyFingerprint,
+    ) -> Result<DeliverySnapshot, Self::Error>;
 
     /// Atomically reacquires materialization capability for the same externally staged immediate
     /// artifact after its prior lease expired or its clock session became invalid.
@@ -6434,7 +6629,7 @@ mod tests {
         policy: SubmissionPolicy,
         claim: DeliveryClaim,
     ) -> DeliverySnapshot {
-        DeliverySnapshot::from_parts(
+        DeliverySnapshot::from_parts_with_immediate_gross_authorization(
             DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
             MigrationRunIdentity::from_stored([TEST_TOKEN_BYTE; DIGEST_LENGTH]),
             DeliveryRunFingerprint::Immediate(proposal.digest()),
@@ -6445,6 +6640,7 @@ mod tests {
             None,
             Some(policy.clone()),
             None,
+            Some(Zatoshis::ZERO),
             vec![claim],
         )
         .unwrap()
@@ -6458,7 +6654,7 @@ mod tests {
         storage_finality: StorageFinality,
     ) -> DeliverySnapshot {
         let proposal = immediate_proposal(vec![proposal_byte]);
-        DeliverySnapshot::from_parts(
+        DeliverySnapshot::from_parts_with_immediate_gross_authorization(
             DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
             MigrationRunIdentity::from_stored([run_byte; DIGEST_LENGTH]),
             DeliveryRunFingerprint::Immediate(proposal.digest()),
@@ -6469,6 +6665,7 @@ mod tests {
             None,
             Some(validated_policy()),
             None,
+            Some(Zatoshis::ZERO),
             vec![],
         )
         .unwrap()
@@ -6819,6 +7016,26 @@ mod tests {
         assert!(DirectTlsEndpoint::try_from("https://example.com:09067".to_string()).is_err());
         assert!(DirectTlsEndpoint::try_from("https://user@example.com".to_string()).is_err());
         assert!(DirectTlsEndpoint::try_from("https://example.com/path".to_string()).is_err());
+        assert!(DirectTlsEndpoint::try_from("https://10.0.0.1:9067".to_string()).is_err());
+        assert!(DirectTlsEndpoint::try_from("https://169.254.169.254:9067".to_string()).is_err());
+        assert!(DirectTlsEndpoint::try_from("https://2130706433:9067".to_string()).is_err());
+        assert!(DirectTlsEndpoint::try_from("https://0x7f000001:9067".to_string()).is_err());
+        assert!(DirectTlsEndpoint::try_from("https://[::1]:9067".to_string()).is_err());
+
+        assert!(
+            TorProxyTlsEndpoint::try_from("https://lightwalletd.example:9067".to_string()).is_ok()
+        );
+        assert!(TorProxyTlsEndpoint::try_from("http://example.com:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://localhost:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://service.onion:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://10.0.0.1:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://192.168.1.1:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://169.254.169.254:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://0.0.0.0:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://127.1:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://2130706433:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://0x7f000001:9067".to_string()).is_err());
+        assert!(TorProxyTlsEndpoint::try_from("https://[::1]:9067".to_string()).is_err());
 
         let onion = format!("http://{TEST_ONION_LABEL}.onion:9067");
         assert!(TorOnionEndpoint::try_from(onion).is_ok());
@@ -6911,6 +7128,30 @@ mod tests {
                 test_context(),
             ),
             Err(PolicyValidationFailure::InvalidEncoding)
+        );
+    }
+
+    #[test]
+    fn policy_codec_preserves_public_tls_over_tor_as_a_distinct_transport() {
+        let context = test_context();
+        let transport = SubmissionTransport::TorProxyTls(
+            TorProxyTlsEndpoint::try_from("https://lightwalletd.example:9067".to_string()).unwrap(),
+        );
+        let policy = SubmissionPolicy::validate(
+            SubmissionPolicyRequest::new(context, transport.clone()),
+            context,
+        )
+        .unwrap();
+        let decoded = SubmissionPolicy::decode(
+            policy.canonical_bytes().to_vec(),
+            policy.fingerprint(),
+            context,
+        )
+        .unwrap();
+        assert_eq!(decoded.request().transport(), &transport);
+        assert_eq!(
+            decoded.request().transport().endpoint(),
+            "https://lightwalletd.example:9067"
         );
     }
 
@@ -7095,13 +7336,35 @@ mod tests {
         let current_release = ReservationRelease::at(BlockHeight::from_u32(TEST_RELEASE_HEIGHT));
         let predecessor_release =
             ReservationRelease::at(BlockHeight::from_u32(TEST_RELEASE_HEIGHT + 100));
-        let current = empty_immediate_snapshot(
-            21,
-            22,
-            23,
+        let (proposal, evidence) = immediate_evidence();
+        let policy = validated_policy();
+        let current_claim = DeliveryClaim::from_parts(
+            evidence,
+            SignerOwnership::Sdk,
+            ClaimStatus::MaterializationFailed,
+            None,
+            None,
+            None,
+            None,
+            policy.fingerprint(),
+            Some(DeliveryFailureReason::MaterializationFailed),
+        )
+        .unwrap();
+        let current = DeliverySnapshot::from_parts_with_immediate_gross_authorization(
+            DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
+            MigrationRunIdentity::from_stored([21; DIGEST_LENGTH]),
+            DeliveryRunFingerprint::Immediate(proposal.digest()),
+            SourceReservationOwner::from_stored([22; DIGEST_LENGTH]),
             DeliveryPhase::Paused,
             StorageFinality::CompletePendingFinality(current_release),
-        );
+            1,
+            None,
+            Some(policy),
+            None,
+            Some(Zatoshis::ZERO),
+            vec![current_claim],
+        )
+        .unwrap();
         let predecessor = RetainedMigrationRun::from_observed(
             None,
             empty_immediate_snapshot(
@@ -7145,6 +7408,154 @@ mod tests {
                 _
             ))
         ));
+    }
+
+    #[test]
+    fn missing_immediate_authorization_is_diagnosed_only_at_forward_exposure_boundary() {
+        let (proposal, evidence) = immediate_evidence();
+        let policy = validated_policy();
+        let exact_bytes = vec![TEST_TRANSACTION_BYTE];
+        let exact = ExactTransaction {
+            artifact_identity: evidence.identity(),
+            txid: TxId::from_bytes([TEST_TXID_BYTE; DIGEST_LENGTH]),
+            consensus_expiry_height: evidence.expiry_height(),
+            digest: ExactTransactionDigest::from_transaction_bytes(&exact_bytes),
+            bytes: exact_bytes,
+        };
+        let legacy_snapshot = |status, storage_finality| {
+            let last_error = (status == ClaimStatus::OutcomeUnknown)
+                .then_some(DeliveryFailureReason::TransportOutcomeUnknown);
+            let claim = DeliveryClaim::from_parts(
+                evidence.clone(),
+                SignerOwnership::Sdk,
+                status,
+                None,
+                None,
+                None,
+                Some(exact.clone()),
+                policy.fingerprint(),
+                last_error,
+            )
+            .unwrap();
+            DeliverySnapshot::from_parts(
+                DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
+                MigrationRunIdentity::from_stored([TEST_TOKEN_BYTE; DIGEST_LENGTH]),
+                DeliveryRunFingerprint::Immediate(proposal.digest()),
+                SourceReservationOwner::from_stored([TEST_FINGERPRINT_BYTE; DIGEST_LENGTH]),
+                DeliveryPhase::Active,
+                storage_finality,
+                1,
+                None,
+                Some(policy.clone()),
+                None,
+                vec![claim],
+            )
+            .unwrap()
+        };
+        let availability = |snapshot| {
+            MigrationRuntimeSnapshot::from_observed(
+                None,
+                Some(snapshot),
+                vec![],
+                DeliverySchemaProvenance::Compatible(DeliverySchemaVersion::from_u32(2).unwrap()),
+                LegacyCutoverStatus::Fresh,
+                DestinationSpendability::NotSpendable,
+            )
+            .availability()
+        };
+
+        assert_eq!(
+            availability(empty_immediate_snapshot(
+                0xA7,
+                0xA8,
+                0xA9,
+                DeliveryPhase::Active,
+                StorageFinality::Active,
+            )),
+            MigrationRuntimeAvailability::Unavailable(
+                RuntimeUnavailableReason::DeliveryInconsistent
+            ),
+            "a claimless active immediate run cannot project as available",
+        );
+        assert_eq!(
+            availability(empty_immediate_snapshot(
+                0xAA,
+                0xAB,
+                0xAC,
+                DeliveryPhase::Abandoning,
+                StorageFinality::Active,
+            )),
+            MigrationRuntimeAvailability::Available,
+            "a claimless abandonment tombstone must remain recoverable",
+        );
+
+        assert_eq!(
+            availability(legacy_snapshot(
+                ClaimStatus::Staged,
+                StorageFinality::Active
+            )),
+            MigrationRuntimeAvailability::Unavailable(
+                RuntimeUnavailableReason::MissingSpendAuthorization
+            )
+        );
+        for status in [ClaimStatus::OutcomeUnknown, ClaimStatus::Confirmed] {
+            assert_eq!(
+                availability(legacy_snapshot(status, StorageFinality::Active)),
+                MigrationRuntimeAvailability::Available,
+                "{status:?} has chain evidence to reconcile but grants no new submission power",
+            );
+        }
+
+        let recovery = StorageRecoveryReason::ExternalSigningExposureUnresolved;
+        assert_eq!(
+            availability(legacy_snapshot(
+                ClaimStatus::Staged,
+                StorageFinality::RecoveryRequired(recovery),
+            )),
+            MigrationRuntimeAvailability::Unavailable(RuntimeUnavailableReason::FinalityRecovery(
+                recovery
+            )),
+            "finality recovery must take precedence over missing authorization",
+        );
+
+        let release = ReservationRelease::at(BlockHeight::from_u32(TEST_RELEASE_HEIGHT));
+        let terminal = DeliverySnapshot::from_parts(
+            DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
+            MigrationRunIdentity::from_stored([0xC1; DIGEST_LENGTH]),
+            DeliveryRunFingerprint::Immediate(proposal.digest()),
+            SourceReservationOwner::from_stored([0xC2; DIGEST_LENGTH]),
+            DeliveryPhase::Abandoned,
+            StorageFinality::Finalized(release),
+            0,
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        let terminal_runtime = MigrationRuntimeSnapshot::from_observed(
+            None,
+            None,
+            vec![
+                RetainedMigrationRun::from_observed(
+                    None,
+                    terminal,
+                    DestinationSpendability::NotApplicable,
+                )
+                .unwrap(),
+            ],
+            DeliverySchemaProvenance::Compatible(DeliverySchemaVersion::from_u32(2).unwrap()),
+            LegacyCutoverStatus::Fresh,
+            DestinationSpendability::NotApplicable,
+        );
+        assert_eq!(
+            terminal_runtime.availability(),
+            MigrationRuntimeAvailability::Available
+        );
+        assert_eq!(
+            terminal_runtime.account_deletion_authorization(),
+            AccountDeletionAuthorization::Allowed
+        );
     }
 
     #[test]
@@ -7214,7 +7625,7 @@ mod tests {
     fn abandoned_unexposed_run_is_a_deletable_zero_reservation_tombstone() {
         let proposal = immediate_proposal(vec![TEST_ARTIFACT_BYTE]);
         let release = ReservationRelease::at(BlockHeight::from_u32(TEST_RELEASE_HEIGHT));
-        let delivery = DeliverySnapshot::from_parts(
+        let delivery = DeliverySnapshot::from_parts_with_immediate_gross_authorization(
             DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
             MigrationRunIdentity::from_stored([TEST_TOKEN_BYTE; DIGEST_LENGTH]),
             DeliveryRunFingerprint::Immediate(proposal.digest()),
@@ -7225,6 +7636,7 @@ mod tests {
             None,
             None,
             None,
+            Some(Zatoshis::ZERO),
             vec![],
         )
         .unwrap();
@@ -7256,20 +7668,22 @@ mod tests {
             CanonicalMutationAuthorization::Allowed
         );
 
-        let invalid_policy_tombstone = DeliverySnapshot::from_parts(
-            DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
-            MigrationRunIdentity::from_stored([TEST_TOKEN_BYTE; DIGEST_LENGTH]),
-            DeliveryRunFingerprint::Immediate(proposal.digest()),
-            SourceReservationOwner::from_stored([TEST_FINGERPRINT_BYTE; DIGEST_LENGTH]),
-            DeliveryPhase::Abandoned,
-            StorageFinality::Finalized(release),
-            0,
-            None,
-            None,
-            Some(PolicyValidationFailure::NetworkMismatch),
-            vec![],
-        )
-        .unwrap();
+        let invalid_policy_tombstone =
+            DeliverySnapshot::from_parts_with_immediate_gross_authorization(
+                DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
+                MigrationRunIdentity::from_stored([TEST_TOKEN_BYTE; DIGEST_LENGTH]),
+                DeliveryRunFingerprint::Immediate(proposal.digest()),
+                SourceReservationOwner::from_stored([TEST_FINGERPRINT_BYTE; DIGEST_LENGTH]),
+                DeliveryPhase::Abandoned,
+                StorageFinality::Finalized(release),
+                0,
+                None,
+                None,
+                Some(PolicyValidationFailure::NetworkMismatch),
+                Some(Zatoshis::ZERO),
+                vec![],
+            )
+            .unwrap();
         let invalid_policy_runtime = MigrationRuntimeSnapshot::from_observed(
             None,
             Some(invalid_policy_tombstone),
@@ -7579,7 +7993,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let delivery = DeliverySnapshot::from_parts(
+        let delivery = DeliverySnapshot::from_parts_with_immediate_gross_authorization(
             DeliveryRevision::from_stored(TEST_REVISION).unwrap(),
             MigrationRunIdentity::from_stored([TEST_TOKEN_BYTE; DIGEST_LENGTH]),
             DeliveryRunFingerprint::Immediate(proposal.digest()),
@@ -7590,6 +8004,7 @@ mod tests {
             Some(archive),
             Some(policy),
             None,
+            Some(Zatoshis::ZERO),
             vec![confirmed],
         )
         .unwrap();
