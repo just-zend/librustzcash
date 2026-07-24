@@ -1,7 +1,7 @@
 # Ironwood migration capability consolidation
 
 Status: working review note, 2026-07-23. The comparison baseline is
-`zcash/librustzcash` `main` at `31b0607d6f7eaeead5485c76a8d03c73aad62ec5` and
+`zcash/librustzcash` `main` at `683dbd1289fb5768961036bc6984476f7a17f4e5` and
 `just-zend/ZODLIronwoodMigrationRust` `origin/main` at
 `3fb1fdfdfc8185448dbbe7556f38d6c76b4d68e7`. This note records capability
 decisions; the Rust and downstream SDK pull requests remain the review authority.
@@ -64,10 +64,9 @@ persistence in `zcash_client_sqlite` and a minimal Zend delta maintained on top 
   early-carried here: the Zend delta stays on upstream `main` and should take the
   mechanical module/trait migration if and when that PR lands, without retaining a
   parallel locking abstraction.
-- Approved upstream PR [#2751](https://github.com/zcash/librustzcash/pull/2751) is a release-only
-  version/metadata update for `zcash_primitives`, `zcash_proofs`, and `pczt`. Its head is fully
-  green but remains unmerged, so it is tracked rather than early-carried; no migration capability
-  or schema differs from this branch because of it.
+- Merged upstream PR [#2751](https://github.com/zcash/librustzcash/pull/2751) is a release-only
+  version/metadata update for `zcash_primitives` 0.30.0, `zcash_proofs` 0.30.0, and `pczt` 0.8.0.
+  This branch includes that exact upstream merge; it changes no migration capability or schema.
 
 ## Zend improvements retained on top
 
