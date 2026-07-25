@@ -16,11 +16,21 @@
 // macros into scope (the `build` module uses `format!`), and the tests link `std` for `proptest`.
 #[macro_use]
 extern crate alloc;
-#[cfg(test)]
+// The `wallet` adapter integrates with `zcash_client_backend`, which is a `std` crate; link `std`
+// whenever that feature (or the test harness) is active. The `testing` module leans on `proptest`
+// (a `std` crate), so its feature links `std` too.
+#[cfg(any(test, feature = "wallet", feature = "test-dependencies"))]
 extern crate std;
 
 #[cfg(feature = "orchard")]
 pub mod build;
+pub mod engine;
 pub mod note_splitting;
 pub mod preparation;
 pub mod scheduling;
+pub mod state;
+#[cfg(feature = "wallet")]
+pub mod wallet;
+
+#[cfg(any(test, feature = "test-dependencies"))]
+pub mod testing;

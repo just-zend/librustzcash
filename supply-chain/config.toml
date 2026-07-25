@@ -39,6 +39,7 @@ audit-as-crates-io = true
 [policy.incrementalmerkletree-testing]
 
 [policy.orchard]
+audit-as-crates-io = true
 
 [policy.pczt]
 audit-as-crates-io = true
@@ -64,6 +65,9 @@ audit-as-crates-io = true
 audit-as-crates-io = true
 
 [policy.zcash_keys]
+audit-as-crates-io = true
+
+[policy.zcash_pool_migration]
 audit-as-crates-io = true
 
 [policy.zcash_primitives]
@@ -1458,6 +1462,10 @@ version = "0.28.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tor-guardmgr]]
+version = "0.35.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.tor-hsclient]]
 version = "0.35.0"
 criteria = "safe-to-deploy"
 

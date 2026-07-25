@@ -109,6 +109,11 @@ pub enum Error<FE> {
     /// The builder was constructed with a target height before NU6.3 activation,
     /// or without an Ironwood anchor, but an Ironwood spend or output was added.
     IronwoodBuilderNotAvailable,
+    /// Anchors can be deferred to proving time only under a transaction version whose
+    /// txid and sighash exclude shielded anchors (V6, NU6.3 onward); this version commits
+    /// its signatures to the anchors, so they must be supplied at build time (use
+    /// [`Builder`]).
+    AnchorDeferralUnsupported(TxVersion),
     /// An error occurred in constructing a coinbase transaction.
     Coinbase(coinbase::Error),
     /// A coinbase transaction's expiry height does not match its target block height.
@@ -160,6 +165,10 @@ impl<FE: fmt::Display> fmt::Display for Error<FE> {
             Error::IronwoodBuilderNotAvailable => write!(
                 f,
                 "Cannot create Ironwood transactions without an Ironwood anchor, or before NU6.3 activation"
+            ),
+            Error::AnchorDeferralUnsupported(version) => write!(
+                f,
+                "Transaction version {version:?} commits its signatures to shielded anchors, so anchors cannot be deferred to proving time"
             ),
             Error::Coinbase(err) => write!(
                 f,
@@ -253,6 +262,52 @@ impl Progress {
     }
 }
 
+/// The padding policy for a transactional Orchard-family (Orchard or Ironwood) bundle.
+///
+/// This selects only the parameters that vary between transactional bundles: whether a
+/// bundle is produced even when empty, and the minimum action count it is padded to. It
+/// deliberately cannot express an [`orchard::builder::BundleType::Coinbase`] bundle:
+/// coinbase construction is a property of the whole transaction, selected by
+/// [`BuildConfig::Coinbase`], never of an individual pool. Storing padding here rather
+/// than a full `BundleType` keeps the per-pool coinbase state unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BundlePadding {
+    /// Produce a bundle even when no spends or outputs have been added; the resulting
+    /// bundle then consists entirely of dummy actions.
+    pub bundle_required: bool,
+    /// The minimum number of actions to pad the bundle to. `None` uses the orchard
+    /// builder's default 2-action minimum; `Some(1)` leaves the bundle unpadded, so its
+    /// action count reveals the transaction shape (acceptable when that shape is already
+    /// public, e.g. pool migrations).
+    pub pad_to_minimum: Option<u8>,
+}
+
+impl BundlePadding {
+    /// The default padding, matching [`orchard::builder::BundleType::DEFAULT`]: an empty
+    /// bundle is not produced, and a non-empty bundle is padded to the default minimum.
+    pub const DEFAULT: BundlePadding = BundlePadding {
+        bundle_required: false,
+        pad_to_minimum: None,
+    };
+
+    /// Unpadded transactional padding, matching [`orchard::builder::BundleType::UNPADDED`]:
+    /// the bundle is padded only to the one-action consensus minimum, so it contains
+    /// exactly the requested actions.
+    pub const UNPADDED: BundlePadding = BundlePadding {
+        bundle_required: false,
+        pad_to_minimum: Some(1),
+    };
+
+    /// Returns the orchard [`BundleType`](orchard::builder::BundleType) selecting this
+    /// padding. The result is always a `Transactional` bundle type.
+    pub fn bundle_type(self) -> orchard::builder::BundleType {
+        orchard::builder::BundleType::Transactional {
+            bundle_required: self.bundle_required,
+            pad_to_minimum: self.pad_to_minimum,
+        }
+    }
+}
+
 /// Rules for how the builder should be configured for each shielded pool or coinbase tx.
 #[derive(Clone)]
 pub enum BuildConfig {
@@ -260,8 +315,8 @@ pub enum BuildConfig {
         sapling_anchor: Option<sapling::Anchor>,
         orchard_anchor: Option<orchard::Anchor>,
         ironwood_anchor: Option<orchard::Anchor>,
-        orchard_bundle_type: orchard::builder::BundleType,
-        ironwood_bundle_type: orchard::builder::BundleType,
+        orchard_padding: BundlePadding,
+        ironwood_padding: BundlePadding,
     },
     Coinbase {
         miner_data: Option<PushValue>,
@@ -292,16 +347,16 @@ impl BuildConfig {
         match self {
             BuildConfig::Standard {
                 orchard_anchor,
-                orchard_bundle_type,
+                orchard_padding,
                 ..
             } => orchard_anchor.as_ref().map(|a| {
                 orchard::builder::Builder::new(
-                    *orchard_bundle_type,
+                    orchard_padding.bundle_type(),
                     bundle_version,
                     bundle_version.default_flags(),
                     *a,
                 )
-                .expect("the default flags are always representable for a transactional bundle")
+                .expect("a transactional bundle type with default flags is always representable")
             }),
             BuildConfig::Coinbase { .. }
                 if bundle_version == orchard::bundle::BundleVersion::orchard_v3() =>
@@ -329,16 +384,16 @@ impl BuildConfig {
         match self {
             BuildConfig::Standard {
                 ironwood_anchor,
-                ironwood_bundle_type,
+                ironwood_padding,
                 ..
             } => ironwood_anchor.as_ref().map(|a| {
                 orchard::builder::Builder::new(
-                    *ironwood_bundle_type,
+                    ironwood_padding.bundle_type(),
                     bundle_version,
                     bundle_version.default_flags(),
                     *a,
                 )
-                .expect("the default flags are always representable for an Ironwood bundle")
+                .expect("a transactional bundle type with default flags is always representable")
             }),
             BuildConfig::Coinbase { .. } => Some(
                 orchard::builder::Builder::new(
@@ -385,6 +440,294 @@ fn orchard_action_count(
     };
 
     bundle_type.num_actions(flags, num_spends, num_outputs)
+}
+
+/// A builder for V6 (NU6.3 onward) transactions constructed as PCZTs with their
+/// Orchard-family anchors DEFERRED to proving time, per [ZIP 374].
+///
+/// [`Builder`] requires each shielded pool's anchor in its [`BuildConfig`] and a Merkle
+/// witness rooting to it for every spend it adds. This builder takes no anchors at all:
+/// spends are added as bare `(fvk, note)` pairs through the `orchard` crate's own
+/// deferred-anchor support ([`orchard::builder::Builder::new_with_anchor_deferred`]), and the
+/// emitted PCZT carries ABSENT anchor and witness fields, which the PCZT Updater role
+/// (`set_{orchard,ironwood}_anchor` / `set_*_spend_witnesses`) fills in at proving time,
+/// after the transaction has been finalized and SIGNED. This is sound exactly for the V6
+/// transaction format, whose txid and sighash exclude shielded anchors (they are
+/// committed only by the authorizing-data digest), so neither the transaction id nor any
+/// signature commits to the deferred values; [`Self::new`] refuses any earlier format.
+/// The witness-to-anchor consistency check that [`Builder`] performs per spend at
+/// add-spend time is performed instead by the PCZT Prover role, once the real anchor and
+/// witnesses are present.
+///
+/// The builder is deliberately restricted to the two Orchard-family pools (Orchard and
+/// Ironwood): their nullifiers are derived from the note alone, so a spend can be signed
+/// before its witness is known. A Sapling nullifier commits to the note's tree position,
+/// so Sapling spends can never defer their witnesses, and transparent inputs are out of
+/// scope for the pre-signing flows this builder serves; use [`Builder`] for those.
+///
+/// [ZIP 374]: https://zips.z.cash/zip-0374
+pub struct DeferredPcztBuilder<P> {
+    params: P,
+    tx_version: TxVersion,
+    consensus_branch_id: BranchId,
+    target_height: BlockHeight,
+    expiry_height: BlockHeight,
+    orchard_builder: orchard::builder::Builder,
+    orchard_bundle_version: orchard::bundle::BundleVersion,
+    ironwood_builder: orchard::builder::Builder,
+}
+
+impl<P: consensus::Parameters> DeferredPcztBuilder<P> {
+    /// Creates a builder targeting the block at `target_height`, with the given
+    /// transactional bundle padding for each Orchard-family pool.
+    ///
+    /// The expiry height defaults to `target_height` plus the default transaction expiry
+    /// delta; override it with [`Self::with_expiry_height`].
+    ///
+    /// Returns [`Error::AnchorDeferralUnsupported`] if the consensus branch in effect at
+    /// `target_height` does not use the V6 transaction format, whose txid and sighash
+    /// exclude shielded anchors; under any earlier format the anchors cannot outlive
+    /// signing.
+    pub fn new<FE>(
+        params: P,
+        target_height: BlockHeight,
+        orchard_padding: BundlePadding,
+        ironwood_padding: BundlePadding,
+    ) -> Result<Self, Error<FE>> {
+        let consensus_branch_id = BranchId::for_height(&params, target_height);
+        let tx_version = TxVersion::suggested_for_branch(consensus_branch_id);
+        if !tx_version.has_ironwood() {
+            return Err(Error::AnchorDeferralUnsupported(tx_version));
+        }
+        let orchard_bundle_version =
+            bundle_version_for_branch(consensus_branch_id, orchard::ValuePool::Orchard)
+                .expect("a branch with the V6 format supports the Orchard pool");
+        let orchard_builder = orchard::builder::Builder::new_with_anchor_deferred(
+            orchard_padding.bundle_type(),
+            orchard_bundle_version,
+            orchard_bundle_version.default_flags(),
+            orchard::bundle::TxVersion::V6,
+        )
+        .map_err(Error::OrchardBuild)?;
+        let ironwood_bundle_version = orchard::bundle::BundleVersion::ironwood_v3();
+        let ironwood_builder = orchard::builder::Builder::new_with_anchor_deferred(
+            ironwood_padding.bundle_type(),
+            ironwood_bundle_version,
+            ironwood_bundle_version.default_flags(),
+            orchard::bundle::TxVersion::V6,
+        )
+        .map_err(Error::IronwoodBuild)?;
+        Ok(DeferredPcztBuilder {
+            params,
+            tx_version,
+            consensus_branch_id,
+            target_height,
+            expiry_height: target_height + DEFAULT_TX_EXPIRY_DELTA,
+            orchard_builder,
+            orchard_bundle_version,
+            ironwood_builder,
+        })
+    }
+
+    /// Overrides the expiry height for the transaction under construction.
+    ///
+    /// A pre-signed transaction is often broadcast well after it is built, so the caller
+    /// typically sets an expiry derived from the intended broadcast schedule rather than
+    /// the build height; the signatures commit to it.
+    pub fn with_expiry_height(mut self, expiry_height: BlockHeight) -> Self {
+        self.expiry_height = expiry_height;
+        self
+    }
+
+    /// Adds an Orchard note to be spent in this bundle, WITHOUT a witness: the witness,
+    /// like the bundle's anchor, is installed at proving time through the PCZT Updater
+    /// role.
+    pub fn add_orchard_spend<FE>(
+        &mut self,
+        fvk: orchard::keys::FullViewingKey,
+        note: orchard::Note,
+    ) -> Result<(), Error<FE>> {
+        self.orchard_builder.add_spend_unwitnessed(fvk, note)?;
+        Ok(())
+    }
+
+    /// Adds an Orchard recipient to the transaction.
+    pub fn add_orchard_output<FE>(
+        &mut self,
+        ovk: Option<orchard::keys::OutgoingViewingKey>,
+        recipient: orchard::Address,
+        value: Zatoshis,
+        memo: MemoBytes,
+    ) -> Result<(), Error<FE>> {
+        self.orchard_builder
+            .add_output(
+                ovk,
+                recipient,
+                orchard::value::NoteValue::from_raw(value.into()),
+                memo.into_bytes(),
+            )
+            .map_err(Error::OrchardRecipient)
+    }
+
+    /// Adds a wallet-controlled Orchard change output to the transaction.
+    pub fn add_orchard_change_output<FE>(
+        &mut self,
+        fvk: orchard::keys::FullViewingKey,
+        ovk: Option<orchard::keys::OutgoingViewingKey>,
+        recipient: orchard::Address,
+        value: Zatoshis,
+        memo: MemoBytes,
+    ) -> Result<(), Error<FE>> {
+        self.orchard_builder
+            .add_change_output(
+                fvk,
+                ovk,
+                recipient,
+                orchard::value::NoteValue::from_raw(value.into()),
+                memo.into_bytes(),
+            )
+            .map_err(Error::OrchardRecipient)
+    }
+
+    /// Adds an Ironwood note to be spent in this bundle, WITHOUT a witness (see
+    /// [`Self::add_orchard_spend`]).
+    ///
+    /// The note must use [`orchard::note::NoteVersion::V3`], the Ironwood note plaintext
+    /// format.
+    pub fn add_ironwood_spend<FE>(
+        &mut self,
+        fvk: orchard::keys::FullViewingKey,
+        note: orchard::Note,
+    ) -> Result<(), Error<FE>> {
+        if note.version() != orchard::note::NoteVersion::V3 {
+            return Err(Error::IronwoodSpendUnsupportedNoteVersion(note.version()));
+        }
+        self.ironwood_builder
+            .add_spend_unwitnessed(fvk, note)
+            .map_err(Error::IronwoodSpend)
+    }
+
+    /// Adds an Ironwood recipient to the transaction.
+    ///
+    /// This uses [`orchard::note::NoteVersion::V3`], the Ironwood note plaintext format.
+    pub fn add_ironwood_output<FE>(
+        &mut self,
+        ovk: Option<orchard::keys::OutgoingViewingKey>,
+        recipient: orchard::Address,
+        value: Zatoshis,
+        memo: MemoBytes,
+    ) -> Result<(), Error<FE>> {
+        self.ironwood_builder
+            .add_output(
+                ovk,
+                recipient,
+                orchard::value::NoteValue::from_raw(value.into()),
+                memo.into_bytes(),
+            )
+            .map_err(Error::IronwoodRecipient)
+    }
+
+    /// Reports the calculated fee given the specified fee rule, as a function of the
+    /// spends and outputs added so far (each pool's action count includes the padding its
+    /// bundle type prescribes).
+    pub fn get_fee<FR: FeeRule>(&self, fee_rule: &FR) -> Result<Zatoshis, FeeError<FR::Error>> {
+        fee_rule
+            .fee_required(
+                &self.params,
+                self.target_height,
+                core::iter::empty::<crate::transaction::fees::transparent::InputSize>(),
+                core::iter::empty::<usize>(),
+                0,
+                0,
+                orchard_action_count(&self.orchard_builder, false, self.orchard_bundle_version)
+                    .map_err(FeeError::Bundle)?,
+                orchard_action_count(
+                    &self.ironwood_builder,
+                    false,
+                    orchard::bundle::BundleVersion::ironwood_v3(),
+                )
+                .map_err(FeeError::Bundle)?,
+            )
+            .map_err(FeeError::FeeRule)
+    }
+
+    /// Builds the added spends and outputs into the parts of an unproven PCZT whose
+    /// anchors and real-spend witnesses are ABSENT, deferred to proving time: pass the
+    /// result to the PCZT Creator (`build_from_parts`), then finalize, sign, and — at
+    /// proving time — install the real anchor and witnesses through the PCZT Updater
+    /// role before proving.
+    pub fn build_for_pczt<R: RngCore + CryptoRng, FR: FeeRule>(
+        self,
+        mut rng: R,
+        fee_rule: &FR,
+    ) -> Result<PcztResult<P>, Error<FR::Error>> {
+        fn in_use(builder: &orchard::builder::Builder) -> bool {
+            !builder.spends().is_empty()
+                || !builder.outputs().is_empty()
+                || !builder.changes().is_empty()
+        }
+
+        let fee = self.get_fee(fee_rule).map_err(Error::Fee)?;
+
+        // After fees are accounted for, the value balance of the transaction must be zero.
+        let value_balance = [
+            self.orchard_builder
+                .value_balance::<ZatBalance>()
+                .map_err(|_| BalanceError::Overflow)?,
+            self.ironwood_builder
+                .value_balance::<ZatBalance>()
+                .map_err(|_| BalanceError::Overflow)?,
+        ]
+        .into_iter()
+        .sum::<Option<ZatBalance>>()
+        .ok_or(BalanceError::Overflow)?;
+        let balance_after_fees = (value_balance - fee).ok_or(BalanceError::Underflow)?;
+        match balance_after_fees.cmp(&ZatBalance::zero()) {
+            Ordering::Less => {
+                return Err(Error::InsufficientFunds(-balance_after_fees));
+            }
+            Ordering::Greater => {
+                return Err(Error::ChangeRequired(balance_after_fees));
+            }
+            Ordering::Equal => (),
+        };
+
+        let (orchard_bundle, orchard_meta) = if in_use(&self.orchard_builder) {
+            let (bundle, meta) = self
+                .orchard_builder
+                .build_for_pczt(&mut rng)
+                .map_err(Error::OrchardBuild)?;
+            (Some(bundle), meta)
+        } else {
+            (None, orchard::builder::BundleMetadata::empty())
+        };
+        let (ironwood_bundle, ironwood_meta) = if in_use(&self.ironwood_builder) {
+            let (bundle, meta) = self
+                .ironwood_builder
+                .build_for_pczt(&mut rng)
+                .map_err(Error::IronwoodBuild)?;
+            (Some(bundle), meta)
+        } else {
+            (None, orchard::builder::BundleMetadata::empty())
+        };
+
+        Ok(PcztResult {
+            pczt_parts: PcztParts {
+                params: self.params,
+                version: self.tx_version,
+                consensus_branch_id: self.consensus_branch_id,
+                lock_time: 0,
+                expiry_height: self.expiry_height,
+                transparent: None,
+                sapling: None,
+                orchard: orchard_bundle,
+                ironwood: ironwood_bundle,
+            },
+            sapling_meta: SaplingMetadata::empty(),
+            orchard_meta,
+            ironwood_meta,
+        })
+    }
 }
 
 /// The result of a transaction build operation, which includes the resulting transaction along
@@ -1269,29 +1612,41 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
 
         // The Orchard and Ironwood circuit version is fixed by the transaction's
         // consensus branch (both pools share the post-NU6.3 circuit), so derive it
-        // once from the branch rather than from a bundle. Only build the key when
+        // once from the branch rather than from a bundle. Only obtain the key when
         // an Orchard or Ironwood bundle is actually present.
-        let orchard_proving_key = {
-            let build_proving_key = unauthed_tx.orchard_bundle.is_some();
-            let build_proving_key = build_proving_key || unauthed_tx.ironwood_bundle.is_some();
+        let orchard_circuit_version = {
+            let build_proving_key =
+                unauthed_tx.orchard_bundle.is_some() || unauthed_tx.ironwood_bundle.is_some();
             build_proving_key.then(|| {
-                orchard::circuit::ProvingKey::build(
-                    bundle_version_for_branch(
-                        unauthed_tx.consensus_branch_id,
-                        orchard::ValuePool::Orchard,
-                    )
-                    .expect("an Orchard or Ironwood bundle implies an NU5+ consensus branch")
-                    .circuit_version(),
+                bundle_version_for_branch(
+                    unauthed_tx.consensus_branch_id,
+                    orchard::ValuePool::Orchard,
                 )
+                .expect("an Orchard or Ironwood bundle implies an NU5+ consensus branch")
+                .circuit_version()
             })
         };
+
+        // Reuse a process-wide cached proving key rather than reconstructing it on
+        // every `build` call. See `cached_orchard_proving_key`.
+        #[cfg(feature = "std")]
+        let orchard_proving_key: Option<&orchard::circuit::ProvingKey> =
+            orchard_circuit_version.map(cached_orchard_proving_key);
+        // Without `std` there is no thread-safe cache; build the key once for this
+        // transaction. (Proving requires `std` in practice, so this path does not
+        // run when actually creating proofs.)
+        #[cfg(not(feature = "std"))]
+        let orchard_proving_key_storage =
+            orchard_circuit_version.map(orchard::circuit::ProvingKey::build);
+        #[cfg(not(feature = "std"))]
+        let orchard_proving_key: Option<&orchard::circuit::ProvingKey> =
+            orchard_proving_key_storage.as_ref();
 
         let orchard_bundle = unauthed_tx
             .orchard_bundle
             .map(|b| {
                 b.create_proof(
                     orchard_proving_key
-                        .as_ref()
                         .expect("proving key is built when an Orchard bundle is present"),
                     &mut rng,
                 )
@@ -1307,7 +1662,6 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<P, U
             .map(|b| {
                 b.create_proof(
                     orchard_proving_key
-                        .as_ref()
                         .expect("proving key is built when an Ironwood bundle is present"),
                     &mut rng,
                 )
@@ -1447,6 +1801,38 @@ impl<P: consensus::Parameters, U> Builder<P, U> {
     }
 }
 
+/// Returns a process-wide cached Orchard proving key for the given circuit version.
+///
+/// Building an Orchard proving key is expensive, and the transaction builder would
+/// otherwise reconstruct it on every call to [`Builder::build`]. Callers that build
+/// many transactions in a process therefore share a single key per circuit version.
+///
+/// The cache is keyed by [`orchard::circuit::OrchardCircuitVersion`] because the
+/// verifying (and hence proving) keys differ between circuit versions; mixing them
+/// would produce proofs against the wrong key.
+///
+/// This is only available when the `std` feature is enabled, as it relies on
+/// [`std::sync::OnceLock`] for thread-safe lazy initialization. Proving requires
+/// `std` in practice, so this covers the paths that actually create proofs.
+#[cfg(all(feature = "circuits", feature = "std"))]
+pub fn cached_orchard_proving_key(
+    circuit_version: orchard::circuit::OrchardCircuitVersion,
+) -> &'static orchard::circuit::ProvingKey {
+    use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
+    use std::sync::OnceLock;
+
+    static INSECURE_PRE_NU6_2: OnceLock<ProvingKey> = OnceLock::new();
+    static FIXED_POST_NU6_2: OnceLock<ProvingKey> = OnceLock::new();
+    static POST_NU6_3: OnceLock<ProvingKey> = OnceLock::new();
+
+    let cell = match circuit_version {
+        OrchardCircuitVersion::InsecurePreNu6_2 => &INSECURE_PRE_NU6_2,
+        OrchardCircuitVersion::FixedPostNu6_2 => &FIXED_POST_NU6_2,
+        OrchardCircuitVersion::PostNu6_3 => &POST_NU6_3,
+    };
+    cell.get_or_init(|| ProvingKey::build(circuit_version))
+}
+
 #[cfg(feature = "circuits")]
 fn authorize_transparent(
     b: &transparent::bundle::Bundle<transparent::builder::Unauthorized>,
@@ -1523,7 +1909,7 @@ mod tests {
     #[cfg(feature = "circuits")]
     use {
         super::{Builder, Error},
-        crate::transaction::builder::BuildConfig,
+        crate::transaction::builder::{BuildConfig, BundlePadding},
         ::sapling::{Node, Rseed, zip32::ExtendedSpendingKey},
         ::transparent::{address::TransparentAddress, builder::TransparentSigningSet},
         assert_matches::assert_matches,
@@ -1600,8 +1986,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
 
@@ -1622,8 +2008,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
 
@@ -1738,8 +2124,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: None,
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
         builder
@@ -1796,8 +2182,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: None,
                 ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
         let recipient = orchard::keys::FullViewingKey::from(
@@ -1832,8 +2218,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: None,
                 ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
         builder
@@ -1921,8 +2307,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: None,
                 ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
         let (fvk, note, merkle_path) = ironwood_note_with_version(orchard::note::NoteVersion::V2);
@@ -1999,29 +2385,29 @@ mod tests {
         );
     }
 
-    /// `BuildConfig::Standard`'s `orchard_bundle_type` controls padding: the
+    /// `BuildConfig::Standard`'s `orchard_padding` controls padding: the
     /// padded default counts a single-output bundle as 2 actions, while
     /// `UNPADDED` counts exactly the requested single action.
     #[test]
     #[cfg(feature = "circuits")]
-    fn orchard_bundle_type_controls_padding() {
+    fn orchard_padding_controls_padding() {
         let recipient = orchard::keys::FullViewingKey::from(
             &orchard::keys::SpendingKey::from_bytes([0; 32]).unwrap(),
         )
         .address_at(0u32, orchard::keys::Scope::External);
 
-        let config_with = |bundle_type| BuildConfig::Standard {
+        let config_with = |padding| BuildConfig::Standard {
             sapling_anchor: None,
             orchard_anchor: Some(orchard::Anchor::empty_tree()),
             ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-            orchard_bundle_type: bundle_type,
-            ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+            orchard_padding: padding,
+            ironwood_padding: BundlePadding::DEFAULT,
         };
 
         // `orchard_v2` here: the NU6.3 `orchard_v3` version disables cross-address
         // transfers, so a bare output cannot be added.
-        let count_for = |bundle_type| {
-            let config = config_with(bundle_type);
+        let count_for = |padding| {
+            let config = config_with(padding);
             let mut builder = config
                 .orchard_builder(orchard::bundle::BundleVersion::orchard_v2())
                 .unwrap();
@@ -2041,16 +2427,16 @@ mod tests {
             .unwrap()
         };
 
-        assert_eq!(count_for(orchard::builder::BundleType::DEFAULT), 2);
-        assert_eq!(count_for(orchard::builder::BundleType::UNPADDED), 1);
+        assert_eq!(count_for(BundlePadding::DEFAULT), 2);
+        assert_eq!(count_for(BundlePadding::UNPADDED), 1);
     }
 
-    /// Each Orchard protocol value pool's builder takes its bundle type from its
+    /// Each Orchard protocol value pool's builder takes its padding from its
     /// own `BuildConfig::Standard` field.
     #[test]
     #[cfg(feature = "circuits")]
-    fn orchard_protocol_bundle_types_are_per_pool() {
-        let bundle_types = |orchard_bundle_type, ironwood_bundle_type| {
+    fn orchard_protocol_padding_is_per_pool() {
+        let bundle_types = |orchard_padding, ironwood_padding| {
             let builder = Builder::new(
                 nu6_3_test_network(),
                 zcash_protocol::consensus::BlockHeight::from_u32(10),
@@ -2058,8 +2444,8 @@ mod tests {
                     sapling_anchor: None,
                     orchard_anchor: Some(orchard::Anchor::empty_tree()),
                     ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-                    orchard_bundle_type,
-                    ironwood_bundle_type,
+                    orchard_padding,
+                    ironwood_padding,
                 },
             );
 
@@ -2069,21 +2455,18 @@ mod tests {
             )
         };
 
-        for config in [
-            (
-                orchard::builder::BundleType::DEFAULT,
-                orchard::builder::BundleType::DEFAULT,
-            ),
-            (
-                orchard::builder::BundleType::UNPADDED,
-                orchard::builder::BundleType::DEFAULT,
-            ),
-            (
-                orchard::builder::BundleType::DEFAULT,
-                orchard::builder::BundleType::UNPADDED,
-            ),
+        for (orchard_padding, ironwood_padding) in [
+            (BundlePadding::DEFAULT, BundlePadding::DEFAULT),
+            (BundlePadding::UNPADDED, BundlePadding::DEFAULT),
+            (BundlePadding::DEFAULT, BundlePadding::UNPADDED),
         ] {
-            assert_eq!(bundle_types(config.0, config.1), config);
+            assert_eq!(
+                bundle_types(orchard_padding, ironwood_padding),
+                (
+                    orchard_padding.bundle_type(),
+                    ironwood_padding.bundle_type()
+                ),
+            );
         }
     }
 
@@ -2120,8 +2503,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: Some(orchard_anchor),
                 ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::UNPADDED,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::UNPADDED,
             },
         );
         builder
@@ -2167,8 +2550,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
         );
         let fvk = orchard::keys::FullViewingKey::from(
@@ -2215,8 +2598,8 @@ mod tests {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             },
             target_height: sapling_activation_height,
             expiry_height: sapling_activation_height + DEFAULT_TX_EXPIRY_DELTA,
@@ -2277,8 +2660,8 @@ mod tests {
             sapling_anchor: None,
             orchard_anchor: None,
             ironwood_anchor: None,
-            orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-            ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
         };
         let mut builder =
             Builder::new(TEST_NETWORK, tx_height, build_config).with_expiry_height(0u32.into());
@@ -2367,8 +2750,8 @@ mod tests {
             sapling_anchor: Some(witness1.root().into()),
             orchard_anchor: None,
             ironwood_anchor: None,
-            orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-            ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
         };
         let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
 
@@ -2411,8 +2794,8 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: None,
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             assert_matches!(
@@ -2434,8 +2817,8 @@ mod tests {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder
@@ -2460,8 +2843,8 @@ mod tests {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder
@@ -2485,8 +2868,8 @@ mod tests {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder.set_zip233_amount(Zatoshis::const_from_u64(50000));
@@ -2514,8 +2897,8 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder
@@ -2553,8 +2936,8 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder
@@ -2601,8 +2984,8 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder
@@ -2652,8 +3035,8 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
                 ironwood_anchor: None,
-                orchard_bundle_type: orchard::builder::BundleType::DEFAULT,
-                ironwood_bundle_type: orchard::builder::BundleType::DEFAULT,
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
             };
             let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
             builder
@@ -2695,5 +3078,24 @@ mod tests {
                 Some(Zatoshis::const_from_u64(15_000))
             );
         }
+    }
+
+    #[cfg(all(feature = "circuits", feature = "std"))]
+    #[test]
+    fn cached_orchard_proving_key_reuses_one_instance_per_version() {
+        use core::ptr;
+        use orchard::circuit::OrchardCircuitVersion;
+
+        use super::cached_orchard_proving_key;
+
+        // Repeated calls for the same circuit version return the very same cached
+        // key, so building many transactions does not reconstruct it each time.
+        let first = cached_orchard_proving_key(OrchardCircuitVersion::FixedPostNu6_2);
+        let second = cached_orchard_proving_key(OrchardCircuitVersion::FixedPostNu6_2);
+        assert!(ptr::eq(first, second));
+
+        // Distinct circuit versions are cached independently.
+        let other = cached_orchard_proving_key(OrchardCircuitVersion::PostNu6_3);
+        assert!(!ptr::eq(first, other));
     }
 }

@@ -569,6 +569,7 @@ pub struct Spend {
     ///
     /// - This is set by the Updater.
     /// - This is required by the Prover.
+    #[getset(get = "pub")]
     pub(crate) witness: Option<(u32, [[u8; 32]; 32])>,
 
     /// The spend authorization randomizer.
@@ -1748,7 +1749,7 @@ impl From<orchard::pczt::ParseError> for ParseError {
 
 /// Errors that can occur while checking that an Orchard-protocol bundle's spend
 /// witnesses are consistent with its anchor.
-#[cfg(feature = "orchard")]
+#[cfg(all(feature = "orchard", feature = "prover"))]
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum AnchorConsistencyError {
@@ -1766,7 +1767,7 @@ pub enum AnchorConsistencyError {
 /// circuit.
 ///
 /// [ZIP 374]: https://zips.z.cash/zip-0374#anchors-and-pre-authorization
-#[cfg(feature = "orchard")]
+#[cfg(all(feature = "orchard", feature = "prover"))]
 pub(crate) fn verify_witnesses_root_to_anchor(
     bundle: &orchard::pczt::Bundle,
     anchor: orchard::Anchor,
@@ -2279,13 +2280,16 @@ impl Bundle {
             let (magnitude, sign) = bundle.value_sum().magnitude_sign();
             (magnitude, matches!(sign, orchard::value::Sign::Negative))
         };
-        let anchor = bundle.anchor().to_bytes();
+        // A bundle built with its anchor deferred to proving time (ZIP 374) carries the
+        // empty-tree root purely as a placeholder; emit the anchor as ABSENT, for the
+        // Updater role to install before proving.
+        let anchor = (!bundle.anchor_deferred()).then(|| bundle.anchor().to_bytes());
 
         Self {
             actions,
             flags: bundle.flag_byte(),
             value_sum,
-            anchor: Some(anchor),
+            anchor,
             note_version,
             zkproof: bundle
                 .zkproof()

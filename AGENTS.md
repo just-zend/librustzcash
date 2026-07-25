@@ -129,6 +129,71 @@ since Mermaid layout is hard to reason about in plain text.
   below it, and `eip681` stands alone with no in-repo dependencies.
 - `zcash_client_sqlite` sits at the top, depending on `zcash_client_backend`.
 
+## Code Conventions
+
+- **Never use magic numbers.** Do not inline a bare numeric (or string) literal
+  whose meaning is not obvious from context. Give it a `const` with a
+  doc-commented rationale, and reuse the protocol's own named constants
+  (`COIN`, `MAX_MONEY`, the ZIP-317 `MARGINAL_FEE`, `PREP_TX_ACTIONS`,
+  `DENOM_CAP`, ...) rather than re-deriving their values. This applies to
+  production code, tests, and fixtures alike.
+
+- **Public APIs use semantic types, never bare primitives.** A `pub` function,
+  trait method, struct field accessor, or constructor must not represent a
+  domain quantity as a bare integer, byte array, or string: monetary values are
+  `Zatoshis` (or `ZatBalance` where signed), block heights are `BlockHeight`,
+  transaction ids are `TxId`, and so on — reuse the workspace's existing
+  newtype wrappers, or introduce one when none exists. Bare primitives are
+  acceptable only for genuinely unitless quantities (counts, indices) and in
+  module-internal arithmetic, converting at the public boundary; a conversion
+  that cannot fail there must say why in a comment, and one that can fail must
+  return a typed error rather than panic.
+
+- **Keep domain types whole, and convert only at the storage edge.** A newtype
+  must hide its inner primitive (`pub(crate)` field plus `::new` and a
+  `From`/accessor), so no caller can pass a raw `u32`/`u64` where an id or an
+  amount is meant. Collections and options carry the newtype too
+  (`Vec<Zatoshis>` and `Option<Zatoshis>`, never `Vec<u64>`/`Option<u64>`), and
+  reconstruction constructors (`from_parts`, `from_stored_parts`) take and
+  return it. Down-convert to a bare primitive in exactly one place, the storage
+  or wire boundary (binding a SQLite integer, writing a byte blob), and convert
+  straight back on read; a persisted store is then the only code that ever sees
+  the primitive.
+
+- **Canonical binary serialization lives with the type, via `zcash_encoding`.**
+  A type's on-disk / on-wire byte format is a property of the type, not of any
+  one consumer, so define it next to the definition: `read<R: Read>(r) ->
+  io::Result<Self>` and `write<W: Write>(&self, w) -> io::Result<()>`, built
+  from `zcash_encoding` (`Vector` for length-prefixed lists, `CompactSize` for
+  counts and indices, `Optional` for options) over `corez::io::{Read, Write}`
+  so it stays `no_std` (see `zcash_primitives::merkle_tree`,
+  `zcash_protocol::txid`). Serialize an amount as `Zatoshis` -> `u64` LE
+  (`Zatoshis::from_u64(reader.read_u64_le()?)` on read). Do NOT hand-roll a
+  bespoke byte codec inside a downstream (storage) crate, and do NOT use `serde`
+  for a canonical binary format (reserve `serde` for JSON/config). A persistence
+  backend calls the canonical codec for its blob columns and maps only the
+  queryable scalar fields to its own columns.
+
+- **A `proptest` strategy lives with the type it generates.** An `arb_*`
+  strategy for a type belongs in that type's own crate, in its `testing` module
+  behind the `test-dependencies` feature (e.g. `arb_zatoshis` in
+  `zcash_protocol::value::testing`, `arb_txid` next to `TxId`), NOT redefined in
+  each consumer's test module. Before writing an `arb_*`, search the repository
+  for an existing one and reuse it; if the type has none, add the strategy to the
+  type's crate (adding the `testing` module / `test-dependencies` feature there
+  if needed) rather than to the consumer. A downstream crate composes these
+  canonical leaf strategies into strategies for its own types; it does not
+  re-derive the leaves.
+
+- **No issue or PR numbers in code comments, except in TODOs.** A comment must
+  stand on its own, explaining the code in words. Do not annotate it with an
+  issue/PR reference (`issue #2700`, `see #1234`): when the patch already solves
+  the problem the reference is stale noise, and when it tracks future work that
+  belongs in the issue tracker, not the source. Name the concern instead of
+  linking to it. The exception is a `TODO`: referencing the tracking issue from
+  a `TODO` is helpful and does not go stale, because the `TODO` comment should
+  be removed at the time the issue is resolved.
+
 ## Build & Test Commands
 
 For the most part we follow standard Rust `cargo` practices.
@@ -307,6 +372,15 @@ Type safety is paramount. This is a security-critical codebase.
 - **`from_parts` constructors**: Preferred over public struct fields.
 - **`testing` submodules**: Exposed via `test-dependencies` feature for cross-crate
   test utilities (proptest strategies, mock implementations).
+- **Instance-parameterized store modules**: a persistence module keeps its generic
+  machinery private (DDL builders parameterized by table names, the
+  connection wrapper) and exposes ONE public submodule per concrete
+  instantiation that binds the table names, so nothing generic leaks and the
+  table names reflect the instance (e.g. `zcash_client_sqlite`'s
+  `pool_migration::orchard_ironwood` over `orchard_ironwood_migrations`). A
+  second instance is a sibling submodule, not a fork. The blob (de)serialization is not defined here: it is the canonical
+  codec on the types (see the serialization convention above), which the store
+  calls.
 
 ## Database Write Atomicity (`zcash_client_sqlite`)
 
@@ -426,7 +500,22 @@ New features and non-fix changes should branch from `main`.
 
 ## Changelog & Commit Discipline
 
-- Update the crate's `CHANGELOG.md` for any public API change, bug fix, or semantic change.
+- Update the crate's `CHANGELOG.md` for any public API change, bug fix, or
+  semantic change. CHANGELOG updates must **only** reflect completed changes.
+  since the last release, and never interstitial changes in APIs that have been
+  changed multiple times since the last release. The CHANGELOG entry **MUST** be
+  part of the commit that makes the API change. For newly added crates, the CHANGELOG
+  should include **ONLY** a line indicating the initial release; as there is no prior
+  release, there are no API changes for a user to adapt to. CHANGELOG entries should
+  provide **only** the information needed for end users to adapt to API changes, and
+  **never** describe implementation details or contracts that are not visible to
+  a user of the public API.
+- **Never modify a CHANGELOG entry under an already-published version heading**
+  (a released `## [x.y.z] - DATE` section). Those entries are the historical
+  record of what that release shipped; they must not be altered, even to add a
+  clarification, note a later re-export, or fix a detail. Anything a user needs
+  to adapt to a new change belongs in the `## [Unreleased]` section, never
+  edited into a past release.
 - Commits must be discrete semantic changes — no WIP commits in final PR history.
 - Each commit that alters public API must also update docs and changelog in the same commit.
 - Use `git revise` to maintain clean history within a PR.

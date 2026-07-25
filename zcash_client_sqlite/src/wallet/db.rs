@@ -382,6 +382,8 @@ CREATE TABLE "sapling_received_notes" (
     address_id INTEGER
         REFERENCES addresses(id) ON DELETE CASCADE,
     witness_stabilized INTEGER NOT NULL DEFAULT 0,
+    lock_expiry_height INTEGER,
+    lock_owner BLOB,
     UNIQUE (transaction_id, output_index)
 )"#;
 pub(super) const INDEX_SAPLING_RECEIVED_NOTES_ACCOUNT: &str = r#"
@@ -475,6 +477,8 @@ CREATE TABLE "orchard_received_notes" (
         REFERENCES addresses(id) ON DELETE CASCADE,
     witness_stabilized INTEGER NOT NULL DEFAULT 0,
     note_version INTEGER NOT NULL DEFAULT 2,
+    lock_expiry_height INTEGER,
+    lock_owner BLOB,
     UNIQUE (transaction_id, action_index)
 )"#;
 pub(super) const INDEX_ORCHARD_RECEIVED_NOTES_ACCOUNT: &str = r#"
@@ -549,6 +553,8 @@ CREATE TABLE ironwood_received_notes (
         REFERENCES addresses(id) ON DELETE CASCADE,
     witness_stabilized INTEGER NOT NULL DEFAULT 0,
     note_version INTEGER NOT NULL,
+    lock_expiry_height INTEGER,
+    lock_owner BLOB,
     UNIQUE (transaction_id, action_index)
 )";
 pub(super) const INDEX_IRONWOOD_RECEIVED_NOTES_ACCOUNT: &str = "
@@ -587,6 +593,125 @@ CREATE INDEX idx_ironwood_received_note_spends_note_id ON ironwood_received_note
 pub(super) const INDEX_IRONWOOD_RNS_TX: &str = "
 CREATE INDEX idx_ironwood_received_note_spends_transaction_id ON ironwood_received_note_spends (
     transaction_id ASC
+)";
+
+// The in-progress Orchard -> Ironwood pool migration (ZIP 318). The table DDL and store live in the
+// `crate::pool_migration` module; these golden copies track the normalized schema those tables
+// install into `wallet.db`. Every structured value is stored in typed columns and child tables; the
+// only `BLOB` is the pre-signed transaction (`pczt`), which is already-versioned, unstructured bytes.
+
+/// One row per account's active migration: its status and the scalar fields of its note-split
+/// plan. The crossing values are an ordered list in `orchard_ironwood_migration_crossing_values`.
+/// `account_id` is enforced unique by `INDEX_ORCHARD_IRONWOOD_MIGRATIONS_ACCOUNT`, so an account
+/// has at most one migration in progress. It is a foreign key into `accounts` with `ON DELETE
+/// CASCADE`, so deleting an account removes its migration (and its child rows cascade in turn).
+///
+/// `anchor_bucket_interval` records the anchor retention grid the migration was committed against,
+/// in blocks. Every transfer's `anchor_boundary` lies on that grid, and it is provable only while
+/// the wallet still retains those checkpoints, so a mismatch against the wallet's current interval
+/// is reported as an error rather than left to surface as a missing checkpoint at proving time.
+pub(super) const TABLE_ORCHARD_IRONWOOD_MIGRATIONS: &str = "
+CREATE TABLE orchard_ironwood_migrations (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    note_split_fee_buffer INTEGER NOT NULL,
+    note_split_change INTEGER,
+    note_split_prep_fees INTEGER NOT NULL,
+    note_split_total_input INTEGER NOT NULL,
+    note_split_total_migratable INTEGER NOT NULL,
+    anchor_bucket_interval INTEGER NOT NULL
+)";
+/// The note-split crossing values (an ordered list of zatoshi amounts). The funding-note values
+/// have no table of their own: each is its crossing value plus the note-split fee buffer.
+pub(super) const TABLE_ORCHARD_IRONWOOD_MIGRATION_CROSSING_VALUES: &str = "
+CREATE TABLE orchard_ironwood_migration_crossing_values (
+    migration_id INTEGER NOT NULL REFERENCES orchard_ironwood_migrations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (migration_id, ordinal)
+)";
+/// The inputs of each preparation transaction (`source` is `wallet` or `prior`), keyed by the
+/// transaction's `(layer, tx_index)` grid coordinate. The layers/transactions grid has no tables
+/// of its own: every transaction a real plan produces has at least one input and one output (and
+/// no layer is empty), so the grid is implied by the input and output rows.
+pub(super) const TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_INPUTS: &str = "
+CREATE TABLE orchard_ironwood_migration_prep_inputs (
+    migration_id INTEGER NOT NULL REFERENCES orchard_ironwood_migrations(id) ON DELETE CASCADE,
+    layer INTEGER NOT NULL,
+    tx_index INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    wallet_index INTEGER,
+    prior_layer INTEGER,
+    prior_transaction INTEGER,
+    prior_output INTEGER,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (migration_id, layer, tx_index, ordinal)
+)";
+/// The outputs of each preparation transaction (`role` is `funding`, `intermediate`, or `change`),
+/// keyed like the inputs.
+pub(super) const TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_OUTPUTS: &str = "
+CREATE TABLE orchard_ironwood_migration_prep_outputs (
+    migration_id INTEGER NOT NULL REFERENCES orchard_ironwood_migrations(id) ON DELETE CASCADE,
+    layer INTEGER NOT NULL,
+    tx_index INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (migration_id, layer, tx_index, ordinal)
+)";
+/// The preparation plan's direct-funding wallet notes (used as a funding note with no preparation).
+pub(super) const TABLE_ORCHARD_IRONWOOD_MIGRATION_PREP_DIRECT_FUNDING: &str = "
+CREATE TABLE orchard_ironwood_migration_prep_direct_funding (
+    migration_id INTEGER NOT NULL REFERENCES orchard_ironwood_migrations(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    wallet_index INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (migration_id, ordinal)
+)";
+/// One row per migration transaction. `kind` is `preparation` or `transfer`; `pczt` is the pre-signed
+/// transaction (an opaque, already-versioned `BLOB`); `state` is the lifecycle discriminant, with the
+/// hex broadcast `txid` and `mined_height`. `lock_owner` records the `LockOwner` under which this
+/// transaction's notes are locked, if any. Dependencies are edges in
+/// `orchard_ironwood_migration_transaction_deps`.
+pub(super) const TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTIONS: &str = "
+CREATE TABLE orchard_ironwood_migration_transactions (
+    migration_id INTEGER NOT NULL REFERENCES orchard_ironwood_migrations(id) ON DELETE CASCADE,
+    tx_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    kind_layer INTEGER,
+    kind_index INTEGER,
+    kind_crossing INTEGER,
+    pczt BLOB NOT NULL,
+    scheduled_height INTEGER NOT NULL,
+    expiry_height INTEGER NOT NULL,
+    anchor_boundary INTEGER,
+    state TEXT NOT NULL,
+    txid TEXT,
+    mined_height INTEGER,
+    lock_owner BLOB,
+    PRIMARY KEY (migration_id, tx_id)
+)";
+/// The dependency edges between migration transactions.
+pub(super) const TABLE_ORCHARD_IRONWOOD_MIGRATION_TRANSACTION_DEPS: &str = "
+CREATE TABLE orchard_ironwood_migration_transaction_deps (
+    migration_id INTEGER NOT NULL,
+    tx_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    depends_on_tx_id INTEGER NOT NULL,
+    PRIMARY KEY (migration_id, tx_id, ordinal),
+    FOREIGN KEY (migration_id, tx_id)
+        REFERENCES orchard_ironwood_migration_transactions(migration_id, tx_id) ON DELETE CASCADE
+)";
+pub(super) const INDEX_ORCHARD_IRONWOOD_MIGRATION_TX_DUE: &str = "
+CREATE INDEX idx_orchard_ironwood_migration_tx_due ON orchard_ironwood_migration_transactions (
+    state, scheduled_height
+)";
+/// Enforces at most one migration per account.
+pub(super) const INDEX_ORCHARD_IRONWOOD_MIGRATIONS_ACCOUNT: &str = "
+CREATE UNIQUE INDEX idx_orchard_ironwood_migrations_account ON orchard_ironwood_migrations (
+    account_id
 )";
 
 /// Stores the transparent outputs received by the wallet.
@@ -633,6 +758,8 @@ CREATE TABLE "transparent_received_outputs" (
     max_observed_unspent_height INTEGER,
     address_id INTEGER NOT NULL
         REFERENCES addresses(id) ON DELETE CASCADE,
+    lock_expiry_height INTEGER,
+    lock_owner BLOB,
     UNIQUE (transaction_id, output_index)
 )"#;
 pub(super) const INDEX_TRANSPARENT_RECEIVED_OUTPUTS_ACCOUNT: &str = r#"
