@@ -165,6 +165,19 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
 
         // If this wallet has already scanned NU6.3-era blocks, requeue from NU6.3 activation so
         // those historical blocks are rescanned with Ironwood tree state enabled.
+        //
+        // The requeued range is given `FoundNote` priority rather than `Historic`. `Historic` is
+        // the lowest useful priority, so on an upgraded wallet the Ironwood tree stays empty long
+        // after the wallet reports itself synced — the Orchard tree remains checkpointed past the
+        // Ironwood tree indefinitely. Anything that needs an anchor witnessed in BOTH trees, such
+        // as an Orchard -> Ironwood migration transfer, then fails at every attempt until this
+        // backfill happens to complete. `FoundNote` is also the semantically exact priority: it
+        // means "blocks that must be scanned to complete note commitment tree shards", which is
+        // precisely what this requeue exists to do.
+        //
+        // Only the range at or above NU6.3 activation is requeued. Blocks below activation cannot
+        // contain Ironwood actions, so rescanning them for Ironwood tree state would be pure cost;
+        // the split below deliberately restores that sub-range at its original priority.
         if let Some(ironwood_init_height) = chain_tip_height(transaction)?.and_then(|h| {
             self.params
                 .activation_height(NetworkUpgrade::Nu6_3)
@@ -205,7 +218,7 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                         ],
                     )?;
                 }
-                // Rewrite the remainder of the range to have at least priority `Historic`
+                // Rewrite the remainder of the range to have at least priority `FoundNote`
                 transaction.execute(
                     "INSERT INTO scan_queue (block_range_start, block_range_end, priority)
                      VALUES (:block_range_start, :block_range_end, :priority)",
@@ -213,29 +226,29 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                         ":block_range_start": u32::from(ironwood_init_height),
                         ":block_range_end": u32::from(end),
                         ":priority":
-                            std::cmp::max(range_priority, priority_code(&ScanPriority::Historic)),
+                            std::cmp::max(range_priority, priority_code(&ScanPriority::FoundNote)),
                     ],
                 )?;
                 // Rewrite any scanned ranges above the end of the first Ironwood
-                // range to have at least priority `Historic`
+                // range to have at least priority `FoundNote`
                 transaction.execute(
-                    "UPDATE scan_queue SET priority = :historic
+                    "UPDATE scan_queue SET priority = :ironwood_backfill
                      WHERE block_range_start >= :ironwood_initial_range_end
-                     AND priority < :historic",
+                     AND priority < :ironwood_backfill",
                     named_params![
-                        ":historic": priority_code(&ScanPriority::Historic),
+                        ":ironwood_backfill": priority_code(&ScanPriority::FoundNote),
                         ":ironwood_initial_range_end": u32::from(end),
                     ],
                 )?;
             } else {
                 // No scan range straddles the init height; just bump the priority of everything at
-                // or above it to at least `Historic`.
+                // or above it to at least `FoundNote`.
                 transaction.execute(
-                    "UPDATE scan_queue SET priority = :historic
+                    "UPDATE scan_queue SET priority = :ironwood_backfill
                      WHERE block_range_start >= :ironwood_init_height
-                     AND priority < :historic",
+                     AND priority < :ironwood_backfill",
                     named_params![
-                        ":historic": priority_code(&ScanPriority::Historic),
+                        ":ironwood_backfill": priority_code(&ScanPriority::FoundNote),
                         ":ironwood_init_height": u32::from(ironwood_init_height),
                     ],
                 )?;
@@ -346,17 +359,29 @@ mod tests {
         assert_eq!(
             ranges,
             vec![
+                // Below activation the range keeps its original `Scanned` priority: those blocks
+                // cannot contain Ironwood actions, so rescanning them would be pure cost.
                 (
                     u32::from(activation - 10),
                     u32::from(activation),
                     priority_code(&ScanPriority::Scanned),
                 ),
+                // At and above activation the range is requeued for the Ironwood backfill.
                 (
                     u32::from(activation),
                     u32::from(activation + 11),
-                    priority_code(&ScanPriority::Historic),
+                    priority_code(&ScanPriority::FoundNote),
                 ),
             ]
+        );
+
+        // The backfill must outrank `Historic`. At `Historic` it is the lowest useful priority, so
+        // an upgraded wallet reports itself synced while its Ironwood tree is still empty, and
+        // anything needing an anchor witnessed in both the Orchard and Ironwood trees fails until
+        // the backfill happens to finish.
+        assert!(
+            priority_code(&ScanPriority::FoundNote) > priority_code(&ScanPriority::Historic),
+            "the Ironwood backfill must be scheduled ahead of ordinary historic catch-up",
         );
     }
 }
